@@ -65,6 +65,13 @@ jobs:
             libtorch-url: https://github.com/second-state/libtorch-releases/releases/download/v2.7.1/libtorch-cxx11-abi-aarch64-2.7.1.tar.gz
             libtorch-archive: libtorch.tar.gz
             bundle-libtorch: true
+          - os: ubuntu-24.04-arm
+            name: Linux ARM64 (CUDA/Jetson)
+            backend: tch
+            asset-name: asr-linux-aarch64-cuda
+            libtorch-url: https://github.com/second-state/libtorch-releases/releases/download/v2.7.1/libtorch-cxx11-abi-aarch64-cuda12.6-2.7.1.tar.gz
+            libtorch-archive: libtorch.tar.gz
+            bundle-libtorch: true
           - os: macos-latest
             name: macOS ARM64
             backend: mlx
