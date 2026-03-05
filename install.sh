@@ -103,7 +103,30 @@ resolve_asset() {
                 ASSET_NAME="asr-linux-x86_64"
             fi
             ;;
-        linux-aarch64)  ASSET_NAME="asr-linux-aarch64"   ;;
+        linux-aarch64)
+            if [ -n "$CUDA_DRIVER" ]; then
+                echo ""
+                info "NVIDIA GPU detected on ARM64 (Jetson). Choose build variant:"
+                echo "  1) CUDA 12.6  (recommended for Jetson)"
+                echo "  2) CPU only"
+                echo ""
+
+                local choice
+                read -r -p "Select variant [1]: " choice </dev/tty
+                choice="${choice:-1}"
+
+                case "$choice" in
+                    1) USE_CUDA="true";  ASSET_NAME="asr-linux-aarch64-cuda" ;;
+                    2) USE_CUDA="false"; ASSET_NAME="asr-linux-aarch64" ;;
+                    *)
+                        warn "Invalid choice '${choice}', defaulting to CUDA."
+                        USE_CUDA="true"; ASSET_NAME="asr-linux-aarch64-cuda"
+                        ;;
+                esac
+            else
+                ASSET_NAME="asr-linux-aarch64"
+            fi
+            ;;
         macos-x86_64)
             err "macOS x86_64 (Intel) is not supported. Apple Silicon required."
             exit 1

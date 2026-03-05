@@ -33,6 +33,10 @@ detect_platform() {
     echo "${os}-${arch}"
 }
 
+has_nvidia_gpu() {
+    command -v nvidia-smi &>/dev/null && nvidia-smi --query-gpu=driver_version --format=csv,noheader &>/dev/null
+}
+
 get_asset_name() {
     local platform="$1"
 
@@ -41,7 +45,11 @@ get_asset_name() {
         echo "asr-linux-x86_64"
         ;;
     linux-aarch64)
-        echo "asr-linux-aarch64"
+        if has_nvidia_gpu; then
+            echo "asr-linux-aarch64-cuda"
+        else
+            echo "asr-linux-aarch64"
+        fi
         ;;
     darwin-aarch64)
         echo "asr-macos-aarch64"
