@@ -38,9 +38,10 @@ If the automatic download fails, manually install the components:
 
 1. Go to https://github.com/second-state/qwen3_asr_rs/releases/latest
 2. Download the zip for your platform:
-   - `asr-linux-x86_64.zip` (Linux x86_64 — includes libtorch)
+   - `asr-linux-x86_64.zip` (Linux x86_64 CPU — includes libtorch)
    - `asr-linux-x86_64-cuda.zip` (Linux x86_64 CUDA — includes libtorch)
-   - `asr-linux-aarch64.zip` (Linux ARM64 — includes libtorch)
+   - `asr-linux-aarch64.zip` (Linux ARM64 CPU — includes libtorch)
+   - `asr-linux-aarch64-cuda.zip` (Linux ARM64 CUDA / Jetson — includes libtorch)
    - `asr-macos-aarch64.zip` (macOS Apple Silicon — includes mlx.metallib)
 3. Extract the zip and copy contents to the scripts directory:
    ```bash

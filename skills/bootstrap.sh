@@ -1,6 +1,6 @@
 #!/bin/bash
 # Bootstrap script for Qwen3 ASR skill
-# Downloads platform-specific release (binary + runtime deps) and model
+# Downloads platform-specific release (binary + bundled libtorch) and model
 
 set -e
 
@@ -42,7 +42,11 @@ get_asset_name() {
 
     case "$platform" in
     linux-x86_64)
-        echo "asr-linux-x86_64"
+        if has_nvidia_gpu; then
+            echo "asr-linux-x86_64-cuda"
+        else
+            echo "asr-linux-x86_64"
+        fi
         ;;
     linux-aarch64)
         if has_nvidia_gpu; then
@@ -98,7 +102,7 @@ download_release() {
         cp "${temp_dir}/${asset_name}/mlx.metallib" "${SCRIPTS_DIR}/mlx.metallib"
     fi
 
-    # Copy libtorch if present (Linux tch backend)
+    # Copy bundled libtorch if present (all Linux builds)
     if [ -d "${temp_dir}/${asset_name}/libtorch" ]; then
         rm -rf "${SCRIPTS_DIR}/libtorch"
         cp -r "${temp_dir}/${asset_name}/libtorch" "${SCRIPTS_DIR}/libtorch"

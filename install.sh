@@ -1,17 +1,12 @@
 #!/bin/bash
 # install.sh — One-step installer for Qwen3-ASR Rust CLI
-# Downloads the release binary, model weights, and a sample audio file.
+# Downloads the release binary (with bundled libtorch), model weights, and a sample audio file.
 
 set -e
 
 REPO="second-state/qwen3_asr_rs"
 INSTALL_DIR="qwen3_asr_rs"
 SAMPLE_WAV_URL="https://github.com/${REPO}/raw/main/test_audio/sample1.wav"
-
-# libtorch download URLs
-LIBTORCH_CPU_X86_64_URL="https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-2.7.1%2Bcpu.zip"
-LIBTORCH_CPU_AARCH64_URL="https://github.com/second-state/libtorch-releases/releases/download/v2.7.1/libtorch-cxx11-abi-aarch64-2.7.1.tar.gz"
-LIBTORCH_CUDA_X86_64_URL="https://download.pytorch.org/libtorch/cu128/libtorch-cxx11-abi-shared-with-deps-2.7.1%2Bcu128.zip"
 
 # ── colours / helpers ────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -74,16 +69,13 @@ print_platform() {
 
 # ── 2. Map platform → release asset ─────────────────────────────────
 resolve_asset() {
-    USE_CUDA="false"
-
     case "${OS}-${ARCH}" in
         macos-aarch64)  ASSET_NAME="asr-macos-aarch64"  ;;
         linux-x86_64)
-            # If CUDA GPU detected, offer the CUDA build
             if [ -n "$CUDA_DRIVER" ]; then
                 echo ""
                 info "NVIDIA GPU detected. Choose build variant:"
-                echo "  1) CUDA 12.8  (recommended for GPU)"
+                echo "  1) CUDA  (recommended for GPU)"
                 echo "  2) CPU only"
                 echo ""
 
@@ -92,11 +84,11 @@ resolve_asset() {
                 choice="${choice:-1}"
 
                 case "$choice" in
-                    1) USE_CUDA="true";  ASSET_NAME="asr-linux-x86_64-cuda" ;;
-                    2) USE_CUDA="false"; ASSET_NAME="asr-linux-x86_64" ;;
+                    1) ASSET_NAME="asr-linux-x86_64-cuda" ;;
+                    2) ASSET_NAME="asr-linux-x86_64" ;;
                     *)
                         warn "Invalid choice '${choice}', defaulting to CUDA."
-                        USE_CUDA="true"; ASSET_NAME="asr-linux-x86_64-cuda"
+                        ASSET_NAME="asr-linux-x86_64-cuda"
                         ;;
                 esac
             else
@@ -107,7 +99,7 @@ resolve_asset() {
             if [ -n "$CUDA_DRIVER" ]; then
                 echo ""
                 info "NVIDIA GPU detected on ARM64 (Jetson). Choose build variant:"
-                echo "  1) CUDA 12.6  (recommended for Jetson)"
+                echo "  1) CUDA  (recommended for Jetson)"
                 echo "  2) CPU only"
                 echo ""
 
@@ -116,11 +108,11 @@ resolve_asset() {
                 choice="${choice:-1}"
 
                 case "$choice" in
-                    1) USE_CUDA="true";  ASSET_NAME="asr-linux-aarch64-cuda" ;;
-                    2) USE_CUDA="false"; ASSET_NAME="asr-linux-aarch64" ;;
+                    1) ASSET_NAME="asr-linux-aarch64-cuda" ;;
+                    2) ASSET_NAME="asr-linux-aarch64" ;;
                     *)
                         warn "Invalid choice '${choice}', defaulting to CUDA."
-                        USE_CUDA="true"; ASSET_NAME="asr-linux-aarch64-cuda"
+                        ASSET_NAME="asr-linux-aarch64-cuda"
                         ;;
                 esac
             else
@@ -139,6 +131,7 @@ resolve_asset() {
 }
 
 # ── 3. Download & extract release ────────────────────────────────────
+# All Linux release zips bundle libtorch/ — no separate download needed.
 download_release() {
     if [ -d "${INSTALL_DIR}" ]; then
         ok "${INSTALL_DIR}/ already exists — skipping download."
@@ -155,58 +148,6 @@ download_release() {
     mv "${ASSET_NAME}" "${INSTALL_DIR}"
     rm -f "${zip_name}"
     ok "Release extracted to ${INSTALL_DIR}/"
-}
-
-# ── 4. Download libtorch (Linux only) ────────────────────────────────
-setup_libtorch() {
-    # Only needed on Linux — macOS uses MLX
-    if [ "$OS" != "linux" ]; then
-        return
-    fi
-
-    local libtorch_dir="${INSTALL_DIR}/libtorch"
-
-    # CPU release zips bundle libtorch; CUDA release zips do not.
-    if [ -d "$libtorch_dir" ] && [ -d "$libtorch_dir/lib" ]; then
-        ok "libtorch already present (bundled in release)."
-        return
-    fi
-
-    # Determine which libtorch to download
-    local url archive label
-    if [ "$USE_CUDA" = "true" ]; then
-        url="$LIBTORCH_CUDA_X86_64_URL"
-        archive="libtorch-cuda.zip"
-        label="CUDA 12.8"
-        info "Downloading CUDA 12.8 libtorch (this is a large download) ..."
-    elif [ "$ARCH" = "x86_64" ]; then
-        url="$LIBTORCH_CPU_X86_64_URL"
-        archive="libtorch-cpu.zip"
-        label="CPU (x86_64)"
-        info "Downloading CPU libtorch for x86_64 ..."
-    else
-        url="$LIBTORCH_CPU_AARCH64_URL"
-        archive="libtorch-cpu.tar.gz"
-        label="CPU (aarch64)"
-        info "Downloading CPU libtorch for aarch64 ..."
-    fi
-
-    local temp_dir
-    temp_dir=$(mktemp -d)
-
-    curl -fSL -o "${temp_dir}/${archive}" "$url"
-    info "Extracting libtorch ..."
-
-    if [[ "$archive" == *.zip ]]; then
-        unzip -q "${temp_dir}/${archive}" -d "${temp_dir}"
-    else
-        tar xzf "${temp_dir}/${archive}" -C "${temp_dir}"
-    fi
-
-    mv "${temp_dir}/libtorch" "$libtorch_dir"
-    rm -rf "$temp_dir"
-
-    ok "${label} libtorch installed to ${libtorch_dir}/"
 }
 
 choose_model() {
@@ -243,13 +184,10 @@ download_model() {
     mkdir -p "${MODEL_DIR}"
     local base_url="https://huggingface.co/Qwen/${MODEL}/resolve/main"
 
-    # Files needed at runtime: config.json + safetensors weights
-    # (tokenizer.json is copied separately from release assets)
     local files="config.json"
     if [ "$MODEL" = "Qwen3-ASR-0.6B" ]; then
         files="$files model.safetensors"
     else
-        # 1.7B uses sharded weights
         files="$files model.safetensors.index.json model-00001-of-00002.safetensors model-00002-of-00002.safetensors"
     fi
 
@@ -272,7 +210,6 @@ install_tokenizer() {
         return
     fi
 
-    # Determine model size suffix (0.6B or 1.7B)
     local size
     size=$(echo "$MODEL" | grep -oE '[0-9]+\.[0-9]+B')
     local src="${INSTALL_DIR}/tokenizers/tokenizer-${size}.json"
@@ -336,7 +273,6 @@ main() {
     print_platform
     resolve_asset
     download_release
-    setup_libtorch
     choose_model
     download_model
     install_tokenizer
