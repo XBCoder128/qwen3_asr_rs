@@ -156,6 +156,13 @@ Conv2d weights could be pre-transposed at load time for a minor speedup (only af
 - `Tensor::eval()` is a no-op (tch uses eager execution)
 - Weight loading does bf16/f16 → f32 conversion via custom `bf16_bytes_to_f32()` / `half_to_float()`
 
+### Cross-Backend API Pitfall: Scale Convention
+**CRITICAL**: When adding shared `Tensor` methods that serve both tch and MLX backends, pay close attention to parameter semantics.
+
+MLX's `fast_sdpa` takes `scale` as a **multiplier** (`1/sqrt(hd)`), computing `softmax(Q @ K^T * scale) @ V`. The tch manual SDPA must also **multiply** by this scale value. A past bug had the tch SDPA dividing by `scale = 1/sqrt(hd)`, effectively computing `Q*K^T * sqrt(hd)` — the inverse of the correct scaling. This produced wildly wrong softmax distributions and garbage transcription.
+
+Rule: when wrapping MLX fused ops behind a shared `Tensor` API, the tch fallback must use the **same parameter convention** as the MLX kernel. Always verify both backends produce identical numerical results for the same inputs.
+
 ## Testing
 
 ```bash
