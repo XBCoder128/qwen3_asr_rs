@@ -1,8 +1,9 @@
 # Qwen3 ASR -- Rust CLI tools
 
-Pure Rust implementation of [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) automatic speech recognition. The project builds a cross-platform CLI tool suitable for agentic skills for AI agents and bots.
+Pure Rust implementation of [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) automatic speech recognition. The project builds a cross-platform CLI tool and API server suitable for agentic skills for AI agents and bots.
 
 - **asr** generates text from an input audio file (supports most codex and file formats)
+- **asr-server** runs an OpenAI-compatible HTTP API server for audio transcription
 
 Supports two backends: **libtorch** (via the `tch` crate, cross-platform with optional CUDA) and **MLX** (Apple Silicon native via Metal GPU). Loads model weights directly from safetensors files and re-implements the complete neural network forward pass in Rust.
 
@@ -69,6 +70,88 @@ RUST_LOG=debug asr ./Qwen3-ASR-0.6B input.wav
 ```
 Language: Chinese
 Text: 你好世界
+```
+
+## API Server
+
+The `asr-server` binary provides an OpenAI-compatible HTTP API for audio transcription.
+
+### Start the Server
+
+```bash
+asr-server --model-dir ./Qwen3-ASR-0.6B
+```
+
+Options:
+
+```
+--model-dir <PATH>      Path to the Qwen3-ASR model directory (required)
+--host <ADDR>           Host address to bind to (default: 0.0.0.0)
+--port <PORT>           Port to listen on (default: 8080)
+--language <LANG>       Default language for transcription (e.g., chinese, english)
+-v, -vv                 Verbose output (debug, trace)
+```
+
+### Endpoints
+
+#### POST /v1/audio/transcriptions
+
+OpenAI-compatible transcription endpoint. Accepts multipart form data.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `file` | binary | Yes | Audio file (any format supported by FFmpeg) |
+| `language` | string | No | Language hint (e.g., `english`, `chinese`) |
+| `response_format` | string | No | `json` (default), `text`, or `verbose_json` |
+| `model` | string | No | Accepted for compatibility, ignored |
+| `temperature` | float | No | Accepted for compatibility, ignored |
+| `prompt` | string | No | Accepted for compatibility, ignored |
+
+Examples:
+
+```bash
+# JSON response (default)
+curl -X POST http://localhost:8080/v1/audio/transcriptions \
+  -F file=@recording.wav
+
+# {"text":"Thank you for your contribution..."}
+
+# Plain text response
+curl -X POST http://localhost:8080/v1/audio/transcriptions \
+  -F file=@recording.wav \
+  -F response_format=text
+
+# Thank you for your contribution...
+
+# Verbose JSON with language and duration
+curl -X POST http://localhost:8080/v1/audio/transcriptions \
+  -F file=@recording.wav \
+  -F response_format=verbose_json
+
+# {"task":"transcribe","language":"English","duration":7.999,"text":"Thank you..."}
+
+# Force language
+curl -X POST http://localhost:8080/v1/audio/transcriptions \
+  -F file=@recording.wav \
+  -F language=chinese
+```
+
+#### GET /v1/models
+
+Lists available models.
+
+```bash
+curl http://localhost:8080/v1/models
+# {"object":"list","data":[{"id":"qwen3-asr","object":"model","owned_by":"qwen"}]}
+```
+
+#### GET /health
+
+Health check endpoint.
+
+```bash
+curl http://localhost:8080/health
+# {"status":"ok"}
 ```
 
 ## Supported Languages
@@ -149,6 +232,8 @@ cargo build --release --features build-ffmpeg
 ```
 src/
 ├── main.rs            # CLI binary entry point
+├── bin/
+│   └── server.rs      # API server binary entry point
 ├── lib.rs             # Library module declarations
 ├── tensor.rs          # Unified Tensor abstraction (tch/MLX backend)
 ├── config.rs          # Model configuration (from config.json)
