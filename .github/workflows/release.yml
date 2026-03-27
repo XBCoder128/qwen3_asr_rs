@@ -155,6 +155,7 @@ jobs:
         run: |
           mkdir ${{ matrix.asset-name }}
           cp target/release/asr ${{ matrix.asset-name }}/asr
+          cp target/release/asr-server ${{ matrix.asset-name }}/asr-server
           cp -r tokenizers ${{ matrix.asset-name }}/tokenizers
           if [ "${{ matrix.backend }}" = "mlx" ]; then
             cp target/release/build/qwen3_asr-*/out/lib/mlx.metallib ${{ matrix.asset-name }}/

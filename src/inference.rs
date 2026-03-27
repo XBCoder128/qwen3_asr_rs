@@ -90,6 +90,7 @@ impl AsrInference {
         // Step 1: Load and preprocess audio
         tracing::info!("Loading audio from {}", audio_path);
         let samples = audio::load_audio(audio_path, MEL_SAMPLE_RATE)?;
+        let duration_seconds = samples.len() as f64 / MEL_SAMPLE_RATE as f64;
 
         // Step 2: Compute mel spectrogram
         let mel = self.mel_extractor.extract(&samples, self.device)?;
@@ -209,6 +210,7 @@ impl AsrInference {
             text: transcription,
             language: language_detected,
             raw_output: raw_text,
+            duration_seconds,
         })
     }
 
@@ -263,6 +265,7 @@ pub struct TranscribeResult {
     pub text: String,
     pub language: String,
     pub raw_output: String,
+    pub duration_seconds: f64,
 }
 
 fn parse_asr_output(raw: &str, language_forced: bool) -> (String, String) {
