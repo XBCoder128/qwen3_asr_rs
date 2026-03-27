@@ -25,8 +25,7 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 safetensors = "0.5"
-ffmpeg-next = "8"
-ffmpeg-sys-next = "8"
+symphonia = { version = "0.5", features = ["mp3", "aac", "flac", "ogg", "wav"] }
 clap = { version = "4", features = ["derive"] }
 axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
@@ -40,5 +39,3 @@ cmake = "0.1"
 default = ["tch-backend"]
 tch-backend = ["dep:tch"]
 mlx = []
-static-ffmpeg = ["ffmpeg-sys-next/static"]
-build-ffmpeg = ["ffmpeg-sys-next/build", "static-ffmpeg"]

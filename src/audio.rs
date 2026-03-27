@@ -1,161 +1,115 @@
 use anyhow::{Context, Result};
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 
 /// Load an audio file, converting to mono f32 at the target sample rate.
 ///
-/// Uses ffmpeg to decode any audio format (MP3, FLAC, AAC, WAV, OGG, etc.).
-/// Falls back to hound for WAV files if ffmpeg fails.
+/// Uses symphonia to decode common audio formats (MP3, FLAC, AAC, WAV, OGG).
+/// Falls back to hound for WAV files if symphonia fails.
 pub fn load_audio(path: &str, target_sample_rate: u32) -> Result<Vec<f32>> {
-    match load_audio_ffmpeg(path, target_sample_rate) {
+    match load_audio_symphonia(path, target_sample_rate) {
         Ok(samples) => Ok(samples),
         Err(e) => {
-            tracing::warn!("FFmpeg loading failed ({}), trying WAV fallback", e);
+            tracing::warn!("Symphonia loading failed ({}), trying WAV fallback", e);
             load_audio_wav(path, target_sample_rate)
         }
     }
 }
 
-/// Load audio using ffmpeg (any format).
-fn load_audio_ffmpeg(path: &str, target_sample_rate: u32) -> Result<Vec<f32>> {
-    ffmpeg_next::init().context("Failed to initialize ffmpeg")?;
+/// Load audio using symphonia (MP3, FLAC, AAC, WAV, OGG).
+fn load_audio_symphonia(path: &str, target_sample_rate: u32) -> Result<Vec<f32>> {
+    let file = std::fs::File::open(path).context("Failed to open audio file")?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
-    let mut input_ctx =
-        ffmpeg_next::format::input(&path).context("Failed to open audio file")?;
-
-    let audio_stream = input_ctx
-        .streams()
-        .best(ffmpeg_next::media::Type::Audio)
-        .ok_or_else(|| anyhow::anyhow!("No audio stream found in {}", path))?;
-
-    let stream_index = audio_stream.index();
-    let codec_params = audio_stream.parameters();
-
-    let codec_ctx = ffmpeg_next::codec::Context::from_parameters(codec_params)
-        .context("Failed to create codec context")?;
-    let mut decoder = codec_ctx.decoder().audio().context("Failed to create audio decoder")?;
-
-    let mut all_samples: Vec<f32> = Vec::new();
-    let mut resampler: Option<ffmpeg_next::software::resampling::Context> = None;
-
-    // Process packets
-    for (stream, packet) in input_ctx.packets() {
-        if stream.index() != stream_index {
-            continue;
-        }
-        decoder.send_packet(&packet)?;
-        decode_and_resample(
-            &mut decoder,
-            &mut resampler,
-            target_sample_rate,
-            &mut all_samples,
-        )?;
+    let mut hint = Hint::new();
+    if let Some(ext) = std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
     }
 
-    // Flush decoder
-    decoder.send_eof()?;
-    decode_and_resample(
-        &mut decoder,
-        &mut resampler,
-        target_sample_rate,
-        &mut all_samples,
-    )?;
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .context("Failed to probe audio format")?;
 
-    // Flush resampler
-    if let Some(ref mut res) = resampler {
-        flush_resampler(res, &mut all_samples);
+    let mut format = probed.format;
+
+    let track = format
+        .default_track()
+        .ok_or_else(|| anyhow::anyhow!("No audio track found in {}", path))?;
+
+    let track_id = track.id;
+    let source_sample_rate = track.codec_params.sample_rate
+        .ok_or_else(|| anyhow::anyhow!("Unknown sample rate"))?;
+    let channels = track.codec_params.channels
+        .map(|c| c.count())
+        .unwrap_or(1);
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .context("Failed to create audio decoder")?;
+
+    let mut all_samples: Vec<f32> = Vec::new();
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        let decoded = decoder.decode(&packet)?;
+        let spec = *decoded.spec();
+        let num_frames = decoded.frames();
+
+        if num_frames == 0 {
+            continue;
+        }
+
+        let mut sample_buf = SampleBuffer::<f32>::new(num_frames as u64, spec);
+        sample_buf.copy_interleaved_ref(decoded);
+        let interleaved = sample_buf.samples();
+
+        // Downmix to mono
+        if channels > 1 {
+            for frame in interleaved.chunks(channels) {
+                let mono = frame.iter().sum::<f32>() / channels as f32;
+                all_samples.push(mono);
+            }
+        } else {
+            all_samples.extend_from_slice(interleaved);
+        }
     }
 
     if all_samples.is_empty() {
         anyhow::bail!("No audio samples decoded");
     }
 
+    // Resample if needed
+    let samples = if source_sample_rate != target_sample_rate {
+        resample(&all_samples, source_sample_rate, target_sample_rate)?
+    } else {
+        all_samples
+    };
+
     tracing::info!(
-        "Loaded audio via FFmpeg: {} samples ({:.2}s at {}Hz)",
-        all_samples.len(),
-        all_samples.len() as f64 / target_sample_rate as f64,
+        "Loaded audio via Symphonia: {} samples ({:.2}s at {}Hz)",
+        samples.len(),
+        samples.len() as f64 / target_sample_rate as f64,
         target_sample_rate
     );
 
-    Ok(all_samples)
-}
-
-/// Decode frames and resample. Creates the resampler lazily from the first decoded frame.
-fn decode_and_resample(
-    decoder: &mut ffmpeg_next::decoder::Audio,
-    resampler: &mut Option<ffmpeg_next::software::resampling::Context>,
-    target_sample_rate: u32,
-    samples: &mut Vec<f32>,
-) -> Result<()> {
-    let target_format = ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Packed);
-    let target_layout = ffmpeg_next::ChannelLayout::MONO;
-
-    let mut decoded = ffmpeg_next::frame::Audio::empty();
-    while decoder.receive_frame(&mut decoded).is_ok() {
-        let already_target = decoded.format() == target_format
-            && decoded.channel_layout() == target_layout
-            && decoded.rate() == target_sample_rate;
-
-        if already_target {
-            // No conversion needed, extract samples directly
-            append_f32_samples(&decoded, samples);
-            continue;
-        }
-
-        // FFmpeg 8.x may return an empty channel layout for some files.
-        // Set a default layout on the decoded frame so resampling works.
-        if decoded.channel_layout().is_empty() {
-            decoded.set_channel_layout(
-                ffmpeg_next::ChannelLayout::default(decoded.channels() as i32),
-            );
-        }
-
-        // Create resampler lazily from the actual decoded frame's properties
-        if resampler.is_none() {
-            let res = ffmpeg_next::software::resampling::Context::get(
-                decoded.format(),
-                decoded.channel_layout(),
-                decoded.rate(),
-                target_format,
-                target_layout,
-                target_sample_rate,
-            )
-            .context("Failed to create resampler from decoded frame")?;
-            *resampler = Some(res);
-        }
-
-        let res = resampler.as_mut().unwrap();
-        let mut resampled = ffmpeg_next::frame::Audio::empty();
-        res.run(&decoded, &mut resampled)
-            .context("Resampling failed")?;
-        append_f32_samples(&resampled, samples);
-    }
-    Ok(())
-}
-
-fn flush_resampler(
-    resampler: &mut ffmpeg_next::software::resampling::Context,
-    samples: &mut Vec<f32>,
-) {
-    let mut resampled = ffmpeg_next::frame::Audio::empty();
-    // Flush remaining buffered samples. Errors are non-fatal here.
-    for _ in 0..10 {
-        match resampler.flush(&mut resampled) {
-            Ok(Some(_delay)) => {
-                append_f32_samples(&resampled, samples);
-            }
-            _ => break,
-        }
-    }
-}
-
-fn append_f32_samples(frame: &ffmpeg_next::frame::Audio, samples: &mut Vec<f32>) {
-    let n = frame.samples();
-    if n == 0 {
-        return;
-    }
-    let data = frame.data(0);
-    let f32_slice =
-        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n) };
-    samples.extend_from_slice(f32_slice);
+    Ok(samples)
 }
 
 /// Load a WAV file and resample to target rate using rubato.

@@ -178,17 +178,9 @@ tok.backend_tokenizer.save('Qwen3-ASR-0.6B/tokenizer.json')
 
 ### Build for macOS (MLX)
 
-Install dependencies:
-
-```bash
-brew install ffmpeg
-```
-
-Build:
-
 ```bash
 git submodule update --init --recursive
-cargo build --release --no-default-features --features mlx,build-ffmpeg
+cargo build --release --no-default-features --features mlx
 ```
 
 ### Build for Linux (libtorch)
@@ -223,8 +215,7 @@ export LIBTORCH_BYPASS_VERSION_CHECK=1
 Install dependencies and build:
 
 ```bash
-sudo apt-get install -y nasm pkg-config
-cargo build --release --features build-ffmpeg
+cargo build --release
 ```
 
 ## Project Structure
