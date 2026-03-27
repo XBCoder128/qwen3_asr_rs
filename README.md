@@ -257,6 +257,30 @@ src/
         └── stream.rs  # Device/stream management
 ```
 
+## Performance
+
+Benchmarked on Apple M4 Mac Mini (16GB RAM), MLX Metal GPU backend. All times are warm runs (post-shader compilation), best-of-3.
+
+### Qwen3-ASR-0.6B
+
+| Test File | Audio Duration | Tokens | CLI | API Server |
+|-----------|---------------|--------|-----|------------|
+| sample1.wav (English) | 8.0s | 31 | 2.35s | 2.10s |
+| speech_en.wav (English) | 3.5s | 15 | 1.30s | 1.05s |
+| sample2.wav (English) | 2.8s | 13 | 1.17s | 0.95s |
+| sample3.wav (Chinese) | 5.6s | 15 | 1.31s | 1.07s |
+
+### Qwen3-ASR-1.7B
+
+| Test File | Audio Duration | Tokens | CLI | API Server |
+|-----------|---------------|--------|-----|------------|
+| sample1.wav (English) | 8.0s | 31 | 6.26s | 5.80s |
+| speech_en.wav (English) | 3.5s | 15 | 3.40s | 3.06s |
+| sample2.wav (English) | 2.8s | 13 | 2.82s | 2.59s |
+| sample3.wav (Chinese) | 5.6s | 15 | 3.31s | 2.94s |
+
+The API server is faster per request because the model stays loaded in memory, avoiding the process startup and model loading overhead of the CLI.
+
 ## License
 
 Apache-2.0
