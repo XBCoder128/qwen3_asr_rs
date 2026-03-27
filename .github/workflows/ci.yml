@@ -108,6 +108,39 @@ jobs:
       - name: "[0.6B] Transcribe sample3 (Chinese)"
         run: ./target/release/asr Qwen3-ASR-0.6B test_audio/sample3.wav
 
+      - name: "[0.6B] API server test"
+        run: |
+          ./target/release/asr-server --model-dir Qwen3-ASR-0.6B --port 8099 &
+          SERVER_PID=$!
+          # Wait for server to be ready
+          for i in $(seq 1 30); do
+            if curl -s http://localhost:8099/health > /dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          # Test health endpoint
+          curl -sf http://localhost:8099/health | grep -q '"ok"'
+          echo "Health check passed"
+          # Test models endpoint
+          curl -sf http://localhost:8099/v1/models | grep -q '"qwen3-asr"'
+          echo "Models endpoint passed"
+          # Test transcription (json)
+          RESULT=$(curl -sf -X POST http://localhost:8099/v1/audio/transcriptions -F file=@test_audio/sample1.wav)
+          echo "Transcription result: $RESULT"
+          echo "$RESULT" | grep -qi "thank you"
+          echo "JSON transcription passed"
+          # Test transcription (text)
+          RESULT=$(curl -sf -X POST http://localhost:8099/v1/audio/transcriptions -F file=@test_audio/sample1.wav -F response_format=text)
+          echo "Text result: $RESULT"
+          echo "$RESULT" | grep -qi "thank you"
+          echo "Text transcription passed"
+          # Test transcription (verbose_json)
+          RESULT=$(curl -sf -X POST http://localhost:8099/v1/audio/transcriptions -F file=@test_audio/sample1.wav -F response_format=verbose_json)
+          echo "Verbose result: $RESULT"
+          echo "$RESULT" | grep -q '"duration"'
+          echo "Verbose JSON transcription passed"
+          kill $SERVER_PID
+          echo "All API tests passed"
+
       - name: Download 1.7B model
         run: python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-ASR-1.7B', local_dir='Qwen3-ASR-1.7B')"
 
