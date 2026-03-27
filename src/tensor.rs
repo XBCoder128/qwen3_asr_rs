@@ -385,6 +385,14 @@ impl Tensor {
 
     // -- Normalization --
 
+    pub fn rms_norm(&self, weight: &Tensor, eps: f64) -> Self {
+        let dtype = self.kind();
+        let x = self.to_dtype(DType::Float32);
+        let variance = (&x.inner * &x.inner).mean_dim([-1i64].as_slice(), true, tch::Kind::Float);
+        let x_normed = &x.inner * (variance + eps).rsqrt();
+        (Tensor::from_tch(x_normed) * weight).to_dtype(dtype)
+    }
+
     pub fn layer_norm(
         &self,
         normalized_shape: &[i64],
@@ -399,6 +407,32 @@ impl Tensor {
             eps,
             true,
         ))
+    }
+
+    /// Apply rotary position embeddings using cos/sin tensors.
+    pub fn apply_rope(&self, cos: &Tensor, sin: &Tensor) -> Tensor {
+        let cos = cos.unsqueeze(0).unsqueeze(0);
+        let sin = sin.unsqueeze(0).unsqueeze(0);
+        let half = self.size().last().unwrap() / 2;
+        let x1 = self.narrow(-1, 0, half);
+        let x2 = self.narrow(-1, half, half);
+        let x_rotated = Tensor::cat(&[(-&x2), x1], -1);
+        self * &cos + x_rotated * &sin
+    }
+
+    /// Scaled dot-product attention: softmax(Q*K^T/scale + mask) * V
+    /// Q: (B, nqh, S, D), K: (B, nkvh, T, D), V: (B, nkvh, T, D)
+    pub fn scaled_dot_product_attention(
+        q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, mask: Option<&Tensor>,
+    ) -> Tensor {
+        // Manual implementation for tch backend
+        let k_t = k.transpose(-2, -1);
+        let mut attn = q.matmul(&k_t) / scale;
+        if let Some(m) = mask {
+            attn = attn + m;
+        }
+        let attn = attn.softmax(-1);
+        attn.matmul(v)
     }
 
     // -- Convolution --
@@ -467,6 +501,9 @@ impl Tensor {
     pub fn shallow_clone(&self) -> Self {
         Tensor::from_tch(self.inner.shallow_clone())
     }
+
+    /// Evaluate tensor (no-op for tch which uses eager execution).
+    pub fn eval(&self) {}
 
     // -- Data extraction --
 
@@ -809,6 +846,14 @@ impl Tensor {
 
     // -- Normalization --
 
+    pub fn rms_norm(&self, weight: &Tensor, eps: f64) -> Self {
+        Tensor::from_mlx(crate::backend::mlx::ops::fast_rms_norm(
+            &self.inner,
+            &weight.inner,
+            eps as f32,
+        ))
+    }
+
     pub fn layer_norm(
         &self,
         _normalized_shape: &[i64],
@@ -836,6 +881,32 @@ impl Tensor {
                 normalized
             }
         }
+    }
+
+    /// Apply rotary position embeddings using cos/sin tensors.
+    pub fn apply_rope(&self, cos: &Tensor, sin: &Tensor) -> Tensor {
+        let cos = cos.unsqueeze(0).unsqueeze(0);
+        let sin = sin.unsqueeze(0).unsqueeze(0);
+        let half = self.size().last().unwrap() / 2;
+        let x1 = self.narrow(-1, 0, half);
+        let x2 = self.narrow(-1, half, half);
+        let x_rotated = Tensor::cat(&[(-&x2), x1], -1);
+        self * &cos + x_rotated * &sin
+    }
+
+    /// Scaled dot-product attention using fused MLX kernel.
+    /// Q: (B, nqh, S, D), K: (B, nkvh, T, D), V: (B, nkvh, T, D)
+    /// Natively handles GQA (different Q and KV head counts).
+    pub fn scaled_dot_product_attention(
+        q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, mask: Option<&Tensor>,
+    ) -> Tensor {
+        Tensor::from_mlx(crate::backend::mlx::ops::fast_sdpa(
+            &q.inner,
+            &k.inner,
+            &v.inner,
+            scale as f32,
+            mask.map(|m| &m.inner),
+        ))
     }
 
     // -- Convolution --
@@ -921,6 +992,11 @@ impl Tensor {
 
     pub fn shallow_clone(&self) -> Self {
         self.clone()
+    }
+
+    /// Force evaluation of the lazy computation graph for this tensor.
+    pub fn eval(&self) {
+        self.inner.eval();
     }
 
     // -- Data extraction --
