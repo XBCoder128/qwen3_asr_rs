@@ -422,17 +422,33 @@ impl Tensor {
 
     /// Scaled dot-product attention: softmax(Q*K^T/scale + mask) * V
     /// Q: (B, nqh, S, D), K: (B, nkvh, T, D), V: (B, nkvh, T, D)
+    /// Handles GQA by expanding KV heads to match Q heads.
     pub fn scaled_dot_product_attention(
         q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, mask: Option<&Tensor>,
     ) -> Tensor {
-        // Manual implementation for tch backend
+        // Expand KV heads to match Q heads for GQA
+        let nqh = q.size()[1];
+        let nkvh = k.size()[1];
+        let (k, v) = if nqh != nkvh {
+            let n_rep = nqh / nkvh;
+            let (bsz, _, seq_len, head_dim) = (k.size()[0], k.size()[1], k.size()[2], k.size()[3]);
+            let k = k.unsqueeze(2)
+                .expand(&[bsz, nkvh, n_rep, seq_len, head_dim], false)
+                .reshape(&[bsz, nqh, seq_len, head_dim]);
+            let v = v.unsqueeze(2)
+                .expand(&[bsz, nkvh, n_rep, seq_len, head_dim], false)
+                .reshape(&[bsz, nqh, seq_len, head_dim]);
+            (k, v)
+        } else {
+            (k.shallow_clone(), v.shallow_clone())
+        };
         let k_t = k.transpose(-2, -1);
         let mut attn = q.matmul(&k_t) / scale;
         if let Some(m) = mask {
             attn = attn + m;
         }
         let attn = attn.softmax(-1);
-        attn.matmul(v)
+        attn.matmul(&v)
     }
 
     // -- Convolution --
