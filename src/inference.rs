@@ -90,6 +90,7 @@ impl AsrInference {
         // Step 1: Load and preprocess audio
         tracing::info!("Loading audio from {}", audio_path);
         let samples = audio::load_audio(audio_path, MEL_SAMPLE_RATE)?;
+        let duration_seconds = samples.len() as f64 / MEL_SAMPLE_RATE as f64;
 
         // Step 2: Compute mel spectrogram
         let mel = self.mel_extractor.extract(&samples, self.device)?;
@@ -98,6 +99,7 @@ impl AsrInference {
 
         // Step 3: Run audio encoder
         let audio_embeds = self.audio_encoder.forward(&mel);
+        audio_embeds.eval(); // Materialize encoder output before decode phase
         let num_audio_tokens = audio_embeds.size()[0] as usize;
         tracing::info!("Audio encoder: {} tokens", num_audio_tokens);
 
@@ -123,18 +125,29 @@ impl AsrInference {
             );
         }
 
-        // Step 6: Build MRoPE position IDs
-        let position_ids = self.build_position_ids(&input_ids);
-
+        // Step 6: Precompute MRoPE cos/sin for all positions (prefill + max decode)
         let text_config = &self.config.thinker_config.text_config;
-        let (cos, sin) = compute_mrope_cos_sin(
-            &position_ids,
+        let max_new_tokens: usize = 4096;
+        // Precompute enough positions for prefill + a generous decode budget
+        let max_total_positions = seq_len + 512;
+        let all_positions: Vec<i64> = (0..max_total_positions as i64).collect();
+        let all_pos_ids: [Vec<i64>; 3] = [
+            all_positions.clone(),
+            all_positions.clone(),
+            all_positions,
+        ];
+        let (all_cos, all_sin) = compute_mrope_cos_sin(
+            &all_pos_ids,
             text_config.head_dim,
             text_config.rope_theta,
             &text_config.mrope_section(),
             text_config.mrope_interleaved(),
             self.device,
         );
+
+        // Prefill cos/sin: positions 0..seq_len
+        let cos = all_cos.narrow(0, 0, seq_len as i64);
+        let sin = all_sin.narrow(0, 0, seq_len as i64);
 
         // Step 7: Prefill
         let mask = create_causal_mask(seq_len as i64, 0, self.device);
@@ -147,15 +160,16 @@ impl AsrInference {
             &mut kv_cache,
             Some(&mask),
         );
+        // Eval prefill output to materialize computation graph before decode loop
+        logits.eval();
 
         // Step 8: Autoregressive generation
         let mut generated_ids: Vec<i64> = Vec::new();
-        let max_new_tokens = 4096;
         let eos_token_ids = vec![ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID];
 
         let mut next_logits = logits.narrow(1, seq_len as i64 - 1, 1).squeeze_dim(1);
 
-        let mut current_pos = position_ids[0].len();
+        let mut current_pos = seq_len;
 
         for _ in 0..max_new_tokens {
             let next_token = next_logits.argmax(-1, false).int64_value(&[0]);
@@ -169,30 +183,17 @@ impl AsrInference {
             let next_input = Tensor::from_slice_i64(&[next_token]).to_device(self.device);
             let next_hidden = self.text_decoder.embed(&next_input).unsqueeze(0);
 
-            let new_pos_ids: [Vec<i64>; 3] = [
-                vec![current_pos as i64],
-                vec![current_pos as i64],
-                vec![current_pos as i64],
-            ];
+            // Index into precomputed cos/sin for this position
+            let new_cos = all_cos.narrow(0, current_pos as i64, 1);
+            let new_sin = all_sin.narrow(0, current_pos as i64, 1);
 
-            let (new_cos, new_sin) = compute_mrope_cos_sin(
-                &new_pos_ids,
-                text_config.head_dim,
-                text_config.rope_theta,
-                &text_config.mrope_section(),
-                text_config.mrope_interleaved(),
-                self.device,
-            );
-
-            let total_len = kv_cache.seq_len();
-            let mask = create_causal_mask(1, total_len, self.device);
-
+            // Single-token decode: causal mask is all-zeros (no masking needed)
             next_logits = self.text_decoder.forward(
                 &next_hidden,
                 &new_cos,
                 &new_sin,
                 &mut kv_cache,
-                Some(&mask),
+                None,
             );
             next_logits = next_logits.squeeze_dim(1);
 
@@ -209,6 +210,7 @@ impl AsrInference {
             text: transcription,
             language: language_detected,
             raw_output: raw_text,
+            duration_seconds,
         })
     }
 
@@ -256,14 +258,6 @@ impl AsrInference {
         Ok((tokens, audio_positions))
     }
 
-    fn build_position_ids(
-        &self,
-        input_ids: &[i64],
-    ) -> [Vec<i64>; 3] {
-        let seq_len = input_ids.len();
-        let positions: Vec<i64> = (0..seq_len as i64).collect();
-        [positions.clone(), positions.clone(), positions]
-    }
 }
 
 /// Result of ASR transcription.
@@ -271,6 +265,7 @@ pub struct TranscribeResult {
     pub text: String,
     pub language: String,
     pub raw_output: String,
+    pub duration_seconds: f64,
 }
 
 fn parse_asr_output(raw: &str, language_forced: bool) -> (String, String) {

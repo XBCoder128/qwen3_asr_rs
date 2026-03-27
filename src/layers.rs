@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use anyhow::Result;
-use crate::tensor::{DType, Device, Tensor};
+use crate::tensor::{Device, Tensor};
 use crate::weights::{get_weight, get_weight_opt};
 
 // ============================================================================
@@ -46,11 +46,7 @@ impl RmsNorm {
     }
 
     pub fn forward(&self, x: &Tensor) -> Tensor {
-        let dtype = x.kind();
-        let x = x.to_dtype(DType::Float32);
-        let variance = (&x * &x).mean_dim(&[-1], true);
-        let x = &x * (&variance + self.eps).rsqrt();
-        (x * &self.weight).to_dtype(dtype)
+        x.rms_norm(&self.weight, self.eps)
     }
 }
 
@@ -59,20 +55,21 @@ impl RmsNorm {
 // ============================================================================
 
 pub struct Linear {
-    pub weight: Tensor,
+    pub weight_t: Tensor, // Pre-transposed weight for matmul
     pub bias: Option<Tensor>,
 }
 
 impl Linear {
     pub fn load(weights: &HashMap<String, Tensor>, prefix: &str) -> Result<Self> {
+        let weight = get_weight(weights, prefix, "weight")?;
         Ok(Self {
-            weight: get_weight(weights, prefix, "weight")?,
+            weight_t: weight.tr(), // Pre-transpose at load time
             bias: get_weight_opt(weights, prefix, "bias"),
         })
     }
 
     pub fn forward(&self, x: &Tensor) -> Tensor {
-        let out = x.matmul(&self.weight.tr());
+        let out = x.matmul(&self.weight_t);
         match &self.bias {
             Some(b) => out + b,
             None => out,
@@ -158,15 +155,8 @@ impl AudioAttention {
         let k = self.k_proj.forward(x).reshape(&[bsz, seq_len, nh, hd]).permute(&[0, 2, 1, 3]);
         let v = self.v_proj.forward(x).reshape(&[bsz, seq_len, nh, hd]).permute(&[0, 2, 1, 3]);
 
-        let scale = (hd as f64).sqrt();
-        let mut attn = q.matmul(&k.transpose(-2, -1)) / scale;
-
-        if let Some(m) = mask {
-            attn = attn + m;
-        }
-
-        let attn = attn.softmax(-1).to_dtype(DType::Float32);
-        let out = attn.matmul(&v); // (bsz, nh, seq_len, hd)
+        let scale = 1.0 / (hd as f64).sqrt();
+        let out = Tensor::scaled_dot_product_attention(&q, &k, &v, scale, mask);
         let out = out.permute(&[0, 2, 1, 3]).reshape(&[bsz, seq_len, nh * hd]);
         self.out_proj.forward(&out)
     }
@@ -304,8 +294,8 @@ impl TextAttention {
         let k = self.apply_head_norm(&k, &self.k_norm);
 
         // Apply RoPE
-        let q = apply_rotary_emb(&q, cos, sin);
-        let k = apply_rotary_emb(&k, cos, sin);
+        let q = q.apply_rope(cos, sin);
+        let k = k.apply_rope(cos, sin);
 
         // Update KV cache
         let (k, v) = if let Some((past_k, past_v)) = kv_cache {
@@ -318,21 +308,9 @@ impl TextAttention {
 
         let new_cache = (k.shallow_clone(), v.shallow_clone());
 
-        // Repeat KV heads to match Q heads
-        let n_rep = self.num_q_heads / self.num_kv_heads;
-        let k = repeat_kv(&k, n_rep);
-        let v = repeat_kv(&v, n_rep);
-
-        // Compute attention
-        let scale = (hd as f64).sqrt();
-        let mut attn_weights = q.matmul(&k.transpose(-2, -1)) / scale;
-
-        if let Some(m) = mask {
-            attn_weights = attn_weights + m;
-        }
-
-        let attn_weights = attn_weights.softmax(-1).to_dtype(x.kind());
-        let out = attn_weights.matmul(&v);
+        // Compute attention using fused SDPA (handles GQA natively)
+        let scale = 1.0 / (hd as f64).sqrt();
+        let out = Tensor::scaled_dot_product_attention(&q, &k, &v, scale, mask);
 
         // Reshape and project output
         let out = out.transpose(1, 2).reshape(&[bsz, seq_len, nqh * hd]);
@@ -344,34 +322,6 @@ impl TextAttention {
     fn apply_head_norm(&self, x: &Tensor, norm: &RmsNorm) -> Tensor {
         norm.forward(x)
     }
-}
-
-/// Repeat KV heads to match the number of query heads.
-fn repeat_kv(x: &Tensor, n_rep: usize) -> Tensor {
-    if n_rep == 1 {
-        return x.shallow_clone();
-    }
-    let (bsz, num_kv_heads, seq_len, head_dim) = x.size4();
-    x.unsqueeze(2)
-        .expand(&[bsz, num_kv_heads, n_rep as i64, seq_len, head_dim], false)
-        .reshape(&[bsz, num_kv_heads * n_rep as i64, seq_len, head_dim])
-}
-
-/// Apply rotary position embeddings.
-fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
-    let cos = cos.unsqueeze(0).unsqueeze(0);
-    let sin = sin.unsqueeze(0).unsqueeze(0);
-
-    let x_rotated = rotate_half(x);
-    x * &cos + x_rotated * &sin
-}
-
-/// Rotate half: split x into two halves and swap with negation.
-fn rotate_half(x: &Tensor) -> Tensor {
-    let half = x.size().last().unwrap() / 2;
-    let x1 = x.narrow(-1, 0, half);
-    let x2 = x.narrow(-1, half, half);
-    Tensor::cat(&[(-&x2), x1], -1)
 }
 
 // ============================================================================

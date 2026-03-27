@@ -41,7 +41,7 @@ pub struct TextDecoder {
     embed_tokens: Tensor,
     layers: Vec<TextDecoderLayer>,
     norm: RmsNorm,
-    lm_head_weight: Tensor,
+    lm_head_weight_t: Tensor, // Pre-transposed for matmul
     config: TextDecoderConfig,
 }
 
@@ -82,7 +82,7 @@ impl TextDecoder {
             embed_tokens,
             layers,
             norm,
-            lm_head_weight,
+            lm_head_weight_t: lm_head_weight.tr(), // Pre-transpose at load time
             config: config.clone(),
         })
     }
@@ -109,7 +109,7 @@ impl TextDecoder {
         }
 
         let hidden = self.norm.forward(&hidden);
-        hidden.matmul(&self.lm_head_weight.tr())
+        hidden.matmul(&self.lm_head_weight_t)
     }
 
     pub fn config(&self) -> &TextDecoderConfig {

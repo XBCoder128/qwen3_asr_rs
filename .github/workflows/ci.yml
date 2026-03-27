@@ -21,11 +21,6 @@ jobs:
             libtorch-url: https://github.com/second-state/libtorch-releases/releases/download/v2.7.1/libtorch-cxx11-abi-aarch64-2.7.1.tar.gz
             libtorch-archive: libtorch.tar.gz
           - os: macos-latest
-            name: macOS ARM64 (tch)
-            backend: tch
-            libtorch-url: https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-2.7.1.zip
-            libtorch-archive: libtorch.zip
-          - os: macos-latest
             name: macOS ARM64 (mlx)
             backend: mlx
 
@@ -57,12 +52,7 @@ jobs:
 
       - name: Extract libtorch
         if: matrix.backend == 'tch'
-        run: |
-          if [[ "${{ matrix.libtorch-archive }}" == *.zip ]]; then
-            unzip -q ${{ matrix.libtorch-archive }}
-          else
-            tar xzf ${{ matrix.libtorch-archive }}
-          fi
+        run: tar xzf ${{ matrix.libtorch-archive }}
 
       - name: Set linker flags (Linux only)
         if: matrix.backend == 'tch' && runner.os == 'Linux'
@@ -97,10 +87,6 @@ jobs:
         if: matrix.backend == 'tch' && runner.os == 'Linux'
         run: echo "LD_LIBRARY_PATH=${{ github.workspace }}/libtorch/lib:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
 
-      - name: Set library path (macOS)
-        if: matrix.backend == 'tch' && runner.os == 'macOS'
-        run: echo "DYLD_LIBRARY_PATH=${{ github.workspace }}/libtorch/lib:$DYLD_LIBRARY_PATH" >> "$GITHUB_ENV"
-
       - name: Download 0.6B model
         run: python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-ASR-0.6B', local_dir='Qwen3-ASR-0.6B')"
 
@@ -121,6 +107,39 @@ jobs:
 
       - name: "[0.6B] Transcribe sample3 (Chinese)"
         run: ./target/release/asr Qwen3-ASR-0.6B test_audio/sample3.wav
+
+      - name: "[0.6B] API server test"
+        run: |
+          ./target/release/asr-server --model-dir Qwen3-ASR-0.6B --port 8099 &
+          SERVER_PID=$!
+          # Wait for server to be ready
+          for i in $(seq 1 30); do
+            if curl -s http://localhost:8099/health > /dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          # Test health endpoint
+          curl -sf http://localhost:8099/health | grep -q '"ok"'
+          echo "Health check passed"
+          # Test models endpoint
+          curl -sf http://localhost:8099/v1/models | grep -q '"qwen3-asr"'
+          echo "Models endpoint passed"
+          # Test transcription (json)
+          RESULT=$(curl -sf -X POST http://localhost:8099/v1/audio/transcriptions -F file=@test_audio/sample1.wav)
+          echo "Transcription result: $RESULT"
+          echo "$RESULT" | grep -qi "thank you"
+          echo "JSON transcription passed"
+          # Test transcription (text)
+          RESULT=$(curl -sf -X POST http://localhost:8099/v1/audio/transcriptions -F file=@test_audio/sample1.wav -F response_format=text)
+          echo "Text result: $RESULT"
+          echo "$RESULT" | grep -qi "thank you"
+          echo "Text transcription passed"
+          # Test transcription (verbose_json)
+          RESULT=$(curl -sf -X POST http://localhost:8099/v1/audio/transcriptions -F file=@test_audio/sample1.wav -F response_format=verbose_json)
+          echo "Verbose result: $RESULT"
+          echo "$RESULT" | grep -q '"duration"'
+          echo "Verbose JSON transcription passed"
+          kill $SERVER_PID
+          echo "All API tests passed"
 
       - name: Download 1.7B model
         run: python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-ASR-1.7B', local_dir='Qwen3-ASR-1.7B')"
