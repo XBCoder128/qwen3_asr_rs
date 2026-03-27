@@ -443,7 +443,7 @@ impl Tensor {
             (k.shallow_clone(), v.shallow_clone())
         };
         let k_t = k.transpose(-2, -1);
-        let mut attn = q.matmul(&k_t) / scale;
+        let mut attn = q.matmul(&k_t) * scale;
         if let Some(m) = mask {
             attn = attn + m;
         }
