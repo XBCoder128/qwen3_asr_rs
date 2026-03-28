@@ -1,6 +1,6 @@
 [package]
 name = "qwen3_asr"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2021"
 description = "Pure Rust implementation of Qwen3 ASR (Automatic Speech Recognition) using libtorch"
 license = "Apache-2.0"
