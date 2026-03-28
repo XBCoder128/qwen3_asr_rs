@@ -22,6 +22,7 @@ target
 
 # Model weights and libtorch
 Qwen3-ASR-0.6B/
+Qwen3-ASR-1.7B/
 libtorch
 
 # Test audio files
