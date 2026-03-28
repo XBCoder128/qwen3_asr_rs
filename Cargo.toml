@@ -5,6 +5,7 @@ edition = "2021"
 description = "Pure Rust implementation of Qwen3 ASR (Automatic Speech Recognition) with libtorch and MLX backends"
 license = "Apache-2.0"
 repository = "https://github.com/second-state/qwen3_asr_rs"
+exclude = ["mlx-c/", "test_audio/", "skills/", "Qwen3-ASR-*"]
 
 [[bin]]
 name = "asr"
