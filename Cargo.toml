@@ -2,8 +2,9 @@
 name = "qwen3_asr"
 version = "0.2.0"
 edition = "2021"
-description = "Pure Rust implementation of Qwen3 ASR (Automatic Speech Recognition) using libtorch"
+description = "Pure Rust implementation of Qwen3 ASR (Automatic Speech Recognition) with libtorch and MLX backends"
 license = "Apache-2.0"
+repository = "https://github.com/second-state/qwen3_asr_rs"
 
 [[bin]]
 name = "asr"
