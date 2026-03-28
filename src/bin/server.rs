@@ -15,8 +15,8 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-use qwen3_asr::inference::AsrInference;
-use qwen3_asr::tensor::Device;
+use qwen3_asr_rs::inference::AsrInference;
+use qwen3_asr_rs::tensor::Device;
 
 // ---------------------------------------------------------------------------
 // CLI arguments
@@ -279,7 +279,7 @@ async fn main() -> Result<()> {
 
     #[cfg(feature = "mlx")]
     let device = {
-        qwen3_asr::backend::mlx::stream::init_mlx(true);
+        qwen3_asr_rs::backend::mlx::stream::init_mlx(true);
         tracing::info!("Using MLX Metal GPU");
         Device::Gpu(0)
     };
