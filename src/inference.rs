@@ -369,11 +369,14 @@ impl AsrInference {
     /// streaming at the cost of potentially slightly different output at
     /// the rollback boundary.
     pub fn init_streaming(
-        &self,
+        &mut self,
         language: Option<&str>,
         rollback_tokens: usize,
     ) -> Result<StreamingState> {
         let _ = language; // forced language not yet supported in streaming
+
+        // Enable chunk-local attention for stable incremental encoding.
+        self.audio_encoder.set_chunk_local(true);
         let text_config = &self.config.thinker_config.text_config;
 
         // Pre-audio token IDs (constant).
@@ -433,58 +436,54 @@ impl AsrInference {
 
         // Step 2: Incremental encoding — only encode new mel frames.
         //
-        // When ASR_FORCE_CHUNK_LOCAL=1, each chunk is encoded independently,
-        // so we can safely encode only the new frames and concatenate.
-        // We cache embeddings up to the last complete chunk boundary; the
-        // tail (if any) is re-encoded each call.
-        let force_chunk_local = std::env::var("ASR_FORCE_CHUNK_LOCAL").as_deref() == Ok("1");
+        // chunk_local is enabled by init_streaming(), so each chunk is
+        // encoded independently and we can safely encode only the new
+        // frames and concatenate. We cache embeddings up to the last
+        // complete chunk boundary; the tail (if any) is re-encoded each call.
+        let audio_embeds =
+            if state.cached_mel_frames > 0 && state.cached_mel_frames < total_mel_frames {
+                // New frames start from the last cached boundary.
+                let new_frame_start = state.cached_mel_frames;
+                let new_frame_count = total_mel_frames - new_frame_start;
+                let new_mel = mel.narrow(1, new_frame_start as i64, new_frame_count as i64);
+                let new_embeds = self.audio_encoder.forward(&new_mel);
+                new_embeds.eval();
 
-        let audio_embeds = if force_chunk_local
-            && state.cached_mel_frames > 0
-            && state.cached_mel_frames < total_mel_frames
-        {
-            // New frames start from the last cached boundary.
-            let new_frame_start = state.cached_mel_frames;
-            let new_frame_count = total_mel_frames - new_frame_start;
-            let new_mel = mel.narrow(1, new_frame_start as i64, new_frame_count as i64);
-            let new_embeds = self.audio_encoder.forward(&new_mel);
-            new_embeds.eval();
+                let cached = state.cached_audio_embeds.as_ref().unwrap();
+                let combined = Tensor::cat(&[cached.shallow_clone(), new_embeds], 0);
+                combined.eval();
 
-            let cached = state.cached_audio_embeds.as_ref().unwrap();
-            let combined = Tensor::cat(&[cached.shallow_clone(), new_embeds], 0);
-            combined.eval();
-
-            // Update cache: store up to the last complete chunk boundary.
-            let full_frames = (total_mel_frames / chunk_size) * chunk_size;
-            if has_tail {
-                // Only cache the full-chunk portion.
-                let tokens_per_chunk = self.audio_encoder.tokens_per_chunk();
-                let full_chunks = full_frames / chunk_size;
-                let full_tokens = full_chunks * tokens_per_chunk;
-                state.cached_audio_embeds = Some(combined.narrow(0, 0, full_tokens as i64));
-                state.cached_mel_frames = full_frames;
+                // Update cache: store up to the last complete chunk boundary.
+                let full_frames = (total_mel_frames / chunk_size) * chunk_size;
+                if has_tail {
+                    // Only cache the full-chunk portion.
+                    let tokens_per_chunk = self.audio_encoder.tokens_per_chunk();
+                    let full_chunks = full_frames / chunk_size;
+                    let full_tokens = full_chunks * tokens_per_chunk;
+                    state.cached_audio_embeds = Some(combined.narrow(0, 0, full_tokens as i64));
+                    state.cached_mel_frames = full_frames;
+                } else {
+                    state.cached_audio_embeds = Some(combined.shallow_clone());
+                    state.cached_mel_frames = total_mel_frames;
+                }
+                combined
             } else {
-                state.cached_audio_embeds = Some(combined.shallow_clone());
-                state.cached_mel_frames = total_mel_frames;
-            }
-            combined
-        } else {
-            // First call or fallback: full encode.
-            let embeds = self.audio_encoder.forward(&mel);
-            embeds.eval();
-            let full_frames = (total_mel_frames / chunk_size) * chunk_size;
-            if has_tail {
-                let tokens_per_chunk = self.audio_encoder.tokens_per_chunk();
-                let full_chunks = full_frames / chunk_size;
-                let full_tokens = full_chunks * tokens_per_chunk;
-                state.cached_audio_embeds = Some(embeds.narrow(0, 0, full_tokens as i64));
-                state.cached_mel_frames = full_frames;
-            } else {
-                state.cached_audio_embeds = Some(embeds.shallow_clone());
-                state.cached_mel_frames = total_mel_frames;
-            }
-            embeds
-        };
+                // First call or fallback: full encode.
+                let embeds = self.audio_encoder.forward(&mel);
+                embeds.eval();
+                let full_frames = (total_mel_frames / chunk_size) * chunk_size;
+                if has_tail {
+                    let tokens_per_chunk = self.audio_encoder.tokens_per_chunk();
+                    let full_chunks = full_frames / chunk_size;
+                    let full_tokens = full_chunks * tokens_per_chunk;
+                    state.cached_audio_embeds = Some(embeds.narrow(0, 0, full_tokens as i64));
+                    state.cached_mel_frames = full_frames;
+                } else {
+                    state.cached_audio_embeds = Some(embeds.shallow_clone());
+                    state.cached_mel_frames = total_mel_frames;
+                }
+                embeds
+            };
         let num_audio_tokens = audio_embeds.size()[0] as usize;
 
         tracing::info!(

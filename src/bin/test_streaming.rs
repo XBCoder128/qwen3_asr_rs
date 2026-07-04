@@ -57,7 +57,7 @@ fn main() -> Result<()> {
     let device = Device::Gpu(0);
 
     eprintln!("[test] Loading model from {:?}", model_dir);
-    let model = AsrInference::load(model_dir, device).context("Failed to load model")?;
+    let mut model = AsrInference::load(model_dir, device).context("Failed to load model")?;
     eprintln!("[test] Model loaded");
 
     let samples = qwen3_asr_rs::audio::load_audio(audio_file, SAMPLE_RATE as u32)

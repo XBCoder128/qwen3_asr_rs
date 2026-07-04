@@ -25,6 +25,12 @@ pub struct AudioEncoder {
     proj2: Linear,
 
     config: AudioEncoderConfig,
+
+    /// When true, each chunk uses independent attention (block-diagonal
+    /// mask with chunks_per_window=1). This makes encoder outputs stable
+    /// under audio growth, enabling incremental KV cache reuse.
+    /// Set via `set_chunk_local(true)` before streaming.
+    chunk_local: bool,
 }
 
 impl AudioEncoder {
@@ -72,7 +78,18 @@ impl AudioEncoder {
             proj1,
             proj2,
             config: config.clone(),
+            chunk_local: false,
         })
+    }
+
+    /// Enable or disable chunk-local attention.
+    ///
+    /// When enabled, each mel chunk is encoded with independent attention
+    /// (no cross-chunk attention). This makes encoder outputs stable when
+    /// audio grows incrementally, which is required for incremental KV cache
+    /// reuse in streaming mode.
+    pub fn set_chunk_local(&mut self, enabled: bool) {
+        self.chunk_local = enabled;
     }
 
     /// Encode mel spectrogram features into continuous audio embeddings.
@@ -184,10 +201,9 @@ impl AudioEncoder {
 
     /// Build a block-diagonal windowed attention mask.
     ///
-    /// When `force_chunk_local` is true (set via ASR_FORCE_CHUNK_LOCAL=1),
-    /// each chunk is its own window (chunks_per_window = 1). This makes
-    /// encoder outputs stable under audio growth, enabling incremental
-    /// KV cache in the decoder.
+    /// When `self.chunk_local` is true, each chunk is its own window
+    /// (chunks_per_window = 1). This makes encoder outputs stable under
+    /// audio growth, enabling incremental KV cache in the decoder.
     fn build_window_mask(
         &self,
         total_tokens: i64,
@@ -197,9 +213,7 @@ impl AudioEncoder {
         let chunk_size = self.config.n_window * 2;
         let chunks_per_window = self.config.n_window_infer / chunk_size;
 
-        let force_chunk_local = std::env::var("ASR_FORCE_CHUNK_LOCAL").as_deref() == Ok("1");
-
-        if force_chunk_local {
+        if self.chunk_local {
             // Each chunk is its own window — always build a block-diagonal mask.
             return Some(self.build_block_diagonal_mask(
                 total_tokens,
