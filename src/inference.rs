@@ -558,6 +558,11 @@ impl AsrInference {
             current_pos += 1;
         }
 
+        // Post-decode: detect and trim long repeated subsequences.
+        // When rollback > 0, the decoder may copy chunks of the prefix.
+        // This catches and removes such repetitions.
+        trim_repeated_tail(&mut generated_ids);
+
         tracing::info!(
             "Streaming: generated {} tokens (prefix={}, new={})",
             generated_ids.len(),
@@ -1129,6 +1134,35 @@ impl AsrInference {
         state.audio_tokens_in_cache = num_audio_tokens;
 
         Ok(logits)
+    }
+}
+
+/// Detect and trim a long repeated subsequence at the end of `ids`.
+///
+/// If the last `len` tokens (len >= MIN_REPEAT) appear earlier in the
+/// sequence (non-overlapping), truncate the repeated tail. This catches
+/// the common case where the decoder copies a large chunk of the prefix.
+fn trim_repeated_tail(ids: &mut Vec<i64>) {
+    const MIN_REPEAT: usize = 6;
+    let n = ids.len();
+    if n < MIN_REPEAT * 2 {
+        return;
+    }
+    // Try from longest possible repeat down to MIN_REPEAT.
+    for len in (MIN_REPEAT..=n / 2).rev() {
+        let tail = &ids[n - len..n];
+        // Search for tail in ids[0..n-len], non-overlapping.
+        for start in 0..=n - len - len {
+            if ids[start..start + len] == *tail {
+                ids.truncate(n - len);
+                tracing::warn!(
+                    "[streaming] trimmed {} repeated tokens (matched at pos {})",
+                    len,
+                    start
+                );
+                return;
+            }
+        }
     }
 }
 
