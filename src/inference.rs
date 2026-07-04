@@ -355,6 +355,11 @@ pub struct StreamingState {
     /// 0 = re-decode all tokens every call (default, exact match).
     /// N = only re-decode the last N tokens, prefix the rest.
     rollback_tokens: usize,
+    /// Forced language (e.g. "english", "chinese"). None = auto-detect.
+    forced_language: Option<String>,
+    /// Token IDs for the language prefix (e.g. "language English").
+    /// Computed once in init_streaming, reused in every prefill.
+    language_prefix_ids: Vec<i64>,
     /// Device for tensor creation.
     device: Device,
 }
@@ -373,11 +378,19 @@ impl AsrInference {
         language: Option<&str>,
         rollback_tokens: usize,
     ) -> Result<StreamingState> {
-        let _ = language; // forced language not yet supported in streaming
-
         // Enable chunk-local attention for stable incremental encoding.
         self.audio_encoder.set_chunk_local(true);
         let text_config = &self.config.thinker_config.text_config;
+
+        // Compute language prefix token IDs if language is forced.
+        // Format: "language English" (matches build_prompt in offline mode).
+        let (forced_language, language_prefix_ids) = if let Some(lang) = language {
+            let prefix = format!("language {}", capitalize_first(lang));
+            let ids = self.tokenizer.encode(&prefix)?;
+            (Some(lang.to_string()), ids)
+        } else {
+            (None, Vec::new())
+        };
 
         // Pre-audio token IDs (constant).
         let pre_audio_ids: Vec<i64> =
@@ -412,6 +425,8 @@ impl AsrInference {
             cached_mel_frames: 0,
             last_generated_ids: Vec::new(),
             rollback_tokens,
+            forced_language,
+            language_prefix_ids,
             device: self.device,
         })
     }
@@ -630,11 +645,15 @@ impl AsrInference {
         }
 
         let raw_text = self.tokenizer.decode(&generated_ids)?;
-        let (language_detected, transcription) = parse_asr_output(&raw_text, false);
+        let (language_detected, transcription) =
+            parse_asr_output(&raw_text, state.forced_language.is_some());
+
+        // When language is forced, use the forced language name.
+        let language = state.forced_language.clone().unwrap_or(language_detected);
 
         Ok(TranscribeResult {
             text: transcription,
-            language: language_detected,
+            language,
             raw_output: raw_text,
             duration_seconds,
         })
@@ -648,9 +667,12 @@ impl AsrInference {
         state: &mut StreamingState,
         text_config: &crate::config::TextDecoderConfig,
     ) -> Result<Tensor> {
-        let seq_len = PRE_AUDIO_TOKEN_COUNT + num_audio_tokens + POST_AUDIO_TOKENS.len();
+        let seq_len = PRE_AUDIO_TOKEN_COUNT
+            + num_audio_tokens
+            + POST_AUDIO_TOKENS.len()
+            + state.language_prefix_ids.len();
 
-        // Build hidden states: pre_audio + audio + post_audio
+        // Build hidden states: pre_audio + audio + post_audio + language_prefix
         let mut hidden_states = state.pre_audio_embeds.shallow_clone();
 
         // Inject audio embeddings
@@ -672,6 +694,14 @@ impl AsrInference {
         let post_tensor = Tensor::from_slice_i64(POST_AUDIO_TOKENS).to_device(state.device);
         let post_embeds = self.text_decoder.embed(&post_tensor).unsqueeze(0);
         hidden_states = Tensor::cat(&[hidden_states, post_embeds], 1);
+
+        // Append language prefix tokens (e.g. "language English")
+        if !state.language_prefix_ids.is_empty() {
+            let lang_tensor =
+                Tensor::from_slice_i64(&state.language_prefix_ids).to_device(state.device);
+            let lang_embeds = self.text_decoder.embed(&lang_tensor).unsqueeze(0);
+            hidden_states = Tensor::cat(&[hidden_states, lang_embeds], 1);
+        }
         hidden_states.eval();
 
         // Cos/sin + mask for full prefill
@@ -749,18 +779,20 @@ impl AsrInference {
             Vec::new()
         };
 
-        let total_new = num_new + POST_AUDIO_TOKENS.len() + prefix_ids.len();
+        let total_new =
+            num_new + POST_AUDIO_TOKENS.len() + state.language_prefix_ids.len() + prefix_ids.len();
 
         tracing::debug!(
-            "[streaming-inc] truncate_len={} num_new={} pos_start={} total_new={} prefix={}",
+            "[streaming-inc] truncate_len={} num_new={} pos_start={} total_new={} prefix={} lang={}",
             truncate_len,
             num_new,
             pos_start,
             total_new,
-            prefix_ids.len()
+            prefix_ids.len(),
+            state.language_prefix_ids.len()
         );
 
-        // Build hidden states: new audio embeds + post-audio embeds + prefix text embeds
+        // Build hidden states: new audio embeds + post-audio embeds + language prefix + rollback prefix text embeds
         let mut parts: Vec<Tensor> = Vec::with_capacity(total_new);
         for i in old_audio..num_audio_tokens {
             parts.push(audio_embeds.get(i as i64).unsqueeze(0).unsqueeze(0));
@@ -768,6 +800,12 @@ impl AsrInference {
         let post_tensor = Tensor::from_slice_i64(POST_AUDIO_TOKENS).to_device(state.device);
         let post_embeds = self.text_decoder.embed(&post_tensor).unsqueeze(0);
         parts.push(post_embeds);
+        if !state.language_prefix_ids.is_empty() {
+            let lang_tensor =
+                Tensor::from_slice_i64(&state.language_prefix_ids).to_device(state.device);
+            let lang_embeds = self.text_decoder.embed(&lang_tensor).unsqueeze(0);
+            parts.push(lang_embeds);
+        }
         if !prefix_ids.is_empty() {
             let prefix_tensor = Tensor::from_slice_i64(&prefix_ids).to_device(state.device);
             let prefix_embeds = self.text_decoder.embed(&prefix_tensor).unsqueeze(0);
@@ -1149,27 +1187,30 @@ impl AsrInference {
         state: &mut StreamingState,
         num_audio_tokens: usize,
     ) -> Result<Tensor> {
+        // Build hidden: post_audio + language_prefix
         let post_tensor = Tensor::from_slice_i64(POST_AUDIO_TOKENS).to_device(state.device);
-        let post_hidden = self.text_decoder.embed(&post_tensor).unsqueeze(0);
+        let mut hidden_parts = vec![self.text_decoder.embed(&post_tensor).unsqueeze(0)];
+
+        if !state.language_prefix_ids.is_empty() {
+            let lang_tensor =
+                Tensor::from_slice_i64(&state.language_prefix_ids).to_device(state.device);
+            let lang_embeds = self.text_decoder.embed(&lang_tensor).unsqueeze(0);
+            hidden_parts.push(lang_embeds);
+        }
+
+        let post_hidden = Tensor::cat(&hidden_parts, 1);
+        let total_len = POST_AUDIO_TOKENS.len() + state.language_prefix_ids.len();
 
         let post_pos_start = (PRE_AUDIO_TOKEN_COUNT + num_audio_tokens) as i64;
-        let cos = state
-            .cos
-            .narrow(0, post_pos_start, POST_AUDIO_TOKENS.len() as i64);
-        let sin = state
-            .sin
-            .narrow(0, post_pos_start, POST_AUDIO_TOKENS.len() as i64);
-        let mask = create_causal_mask(
-            POST_AUDIO_TOKENS.len() as i64,
-            state.cache_seq_len,
-            state.device,
-        );
+        let cos = state.cos.narrow(0, post_pos_start, total_len as i64);
+        let sin = state.sin.narrow(0, post_pos_start, total_len as i64);
+        let mask = create_causal_mask(total_len as i64, state.cache_seq_len, state.device);
 
         let logits = self
             .text_decoder
             .forward(&post_hidden, &cos, &sin, kv_cache, Some(&mask));
         logits.eval();
-        state.cache_seq_len += POST_AUDIO_TOKENS.len() as i64;
+        state.cache_seq_len += total_len as i64;
         let tpc = self.audio_encoder.tokens_per_chunk();
         let fchunks = num_audio_tokens / tpc;
         state.audio_tokens_in_cache = fchunks * tpc;
