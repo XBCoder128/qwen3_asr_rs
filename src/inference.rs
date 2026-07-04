@@ -294,6 +294,810 @@ pub struct TranscribeResult {
     pub duration_seconds: f64,
 }
 
+// ===========================================================================
+// Streaming inference — incremental KV cache reuse
+// ===========================================================================
+//
+// Instead of re-transcribing the full audio each time (O(n²)), we reuse the
+// KV cache from previous iterations. The key insight:
+//
+// With causal attention, K/V at position i only depend on inputs at positions
+// 0..=i. Adding new tokens at later positions does NOT invalidate existing KV.
+//
+// Prompt layout:
+//   [pre_audio(9)] [audio(N)] [post_audio(6)]
+//    positions 0-8   9..9+N-1   9+N..14+N
+//
+// When N grows from N_old to N_new:
+//   1. KV for positions 0..9+N_old-1 is still valid (causal attention)
+//   2. Truncate KV cache to 9+N_old (remove old post_audio tokens)
+//   3. Prefill new audio tokens at positions 9+N_old..9+N_new-1
+//   4. Prefill post_audio tokens at positions 9+N_new..9+N_new+5
+//   5. Decode autoregressively
+//
+// Cost per iteration: O(ΔN + 6) instead of O(N).
+
+/// Number of tokens before audio: im_start system \n im_end \n im_start user \n audio_start
+const PRE_AUDIO_TOKEN_COUNT: usize = 9;
+/// Tokens after audio: audio_end im_end \n im_start assistant \n
+const POST_AUDIO_TOKENS: &[i64] = &[
+    151670, // <|audio_end|>
+    151645, // <|im_end|>
+    198,    // \n
+    151644, // <|im_start|>
+    77091,  // assistant
+    198,    // \n
+];
+
+/// State for incremental streaming ASR.
+pub struct StreamingState {
+    /// KV cache from previous iteration (None on first call).
+    kv_cache: Option<KvCache>,
+    /// Number of audio tokens already encoded and in the KV cache.
+    audio_tokens_in_cache: usize,
+    /// Total sequence length currently in the KV cache.
+    cache_seq_len: i64,
+    /// Precomputed MRoPE cos/sin for all positions.
+    cos: Tensor,
+    sin: Tensor,
+    /// Pre-audio token embeddings (computed once, reused).
+    pre_audio_embeds: Tensor,
+    /// Cached audio embeddings from the previous call. Reused to avoid
+    /// Conv2d batch-size-dependent numerical differences that would
+    /// invalidate the cached KV.
+    cached_audio_embeds: Option<Tensor>,
+    /// Device for tensor creation.
+    device: Device,
+}
+
+impl AsrInference {
+    /// Initialize streaming state. Call once before the first
+    /// `streaming_transcribe` call.
+    pub fn init_streaming(&self, language: Option<&str>) -> Result<StreamingState> {
+        let _ = language; // forced language not yet supported in streaming
+        let text_config = &self.config.thinker_config.text_config;
+
+        // Pre-audio token IDs (constant).
+        let pre_audio_ids: Vec<i64> =
+            vec![151644, 8948, 198, 151645, 198, 151644, 872, 198, 151669];
+
+        // Pre-allocate cos/sin for generous position budget.
+        let max_positions = 1024i64;
+        let positions: Vec<i64> = (0..max_positions).collect();
+        let pos_ids: [Vec<i64>; 3] = [positions.clone(), positions.clone(), positions];
+        let (cos, sin) = compute_mrope_cos_sin(
+            &pos_ids,
+            text_config.head_dim,
+            text_config.rope_theta,
+            &text_config.mrope_section(),
+            text_config.mrope_interleaved(),
+            self.device,
+        );
+
+        // Embed pre-audio tokens once.
+        let pre_tensor = Tensor::from_slice_i64(&pre_audio_ids).to_device(self.device);
+        let pre_audio_embeds = self.text_decoder.embed(&pre_tensor).unsqueeze(0);
+        pre_audio_embeds.eval();
+
+        Ok(StreamingState {
+            kv_cache: None,
+            audio_tokens_in_cache: 0,
+            cache_seq_len: 0,
+            cos,
+            sin,
+            pre_audio_embeds,
+            cached_audio_embeds: None,
+            device: self.device,
+        })
+    }
+
+    /// Incremental streaming transcription.
+    ///
+    /// On the first call, does a full prefill. On subsequent calls, reuses
+    /// the KV cache and only prefills the new audio tokens + post-audio tokens.
+    /// Returns the transcription result.
+    pub fn streaming_transcribe(
+        &self,
+        samples: &[f32],
+        state: &mut StreamingState,
+    ) -> Result<TranscribeResult> {
+        let duration_seconds = samples.len() as f64 / MEL_SAMPLE_RATE as f64;
+
+        // Step 1: Compute mel + encode audio
+        let mel = self.mel_extractor.extract(samples, self.device)?;
+        let audio_embeds = self.audio_encoder.forward(&mel);
+        audio_embeds.eval();
+        let num_audio_tokens = audio_embeds.size()[0] as usize;
+
+        // DIAGNOSTIC: compare current audio_embeds[:old_audio] with the
+        // embeds that were used to build the cached KV. We approximate by
+        // checking if the encoder produces stable outputs for the first
+        // old_audio tokens when given different total audio lengths.
+        if std::env::var("ASR_VERIFY_ENCODER").as_deref() == Ok("1") && state.kv_cache.is_some() {
+            let old_audio = state.audio_tokens_in_cache;
+            if old_audio > 0 && old_audio < num_audio_tokens {
+                // Compare first old_audio embeds between current encoder output
+                // and a re-encode of just the first old_audio tokens worth of
+                // mel frames. We need to figure out how many mel frames
+                // produced old_audio tokens. Each full chunk (100 frames)
+                // produces 13 tokens.
+                let chunk_size = self.audio_encoder.chunk_size();
+                let tokens_per_chunk = self.audio_encoder.tokens_per_chunk();
+                let full_chunks_needed = (old_audio + tokens_per_chunk - 1) / tokens_per_chunk;
+                let mel_frames_needed = full_chunks_needed * chunk_size;
+                let mel_frames_needed = mel_frames_needed.min(mel.size()[1] as usize);
+                let short_mel = mel.narrow(1, 0, mel_frames_needed as i64);
+                let short_embeds = self.audio_encoder.forward(&short_mel);
+                short_embeds.eval();
+
+                // Also re-encode the full mel again to check determinism.
+                let full_embeds2 = self.audio_encoder.forward(&mel);
+                full_embeds2.eval();
+
+                // Compare first old_audio tokens
+                let cur_seg = audio_embeds.narrow(0, 0, old_audio as i64);
+                let short_seg = short_embeds.narrow(0, 0, old_audio as i64);
+                let full2_seg = full_embeds2.narrow(0, 0, old_audio as i64);
+                let emb_diff = (&cur_seg - &short_seg).abs().max().f64_value(&[]);
+                let det_diff = (&cur_seg - &full2_seg).abs().max().f64_value(&[]);
+                tracing::warn!(
+                    "[verify-encoder] old_audio={} mel_frames_needed={} embed_diff={:.3e} determinism_diff={:.3e}",
+                    old_audio,
+                    mel_frames_needed,
+                    emb_diff,
+                    det_diff
+                );
+            }
+        }
+
+        tracing::info!(
+            "[streaming] audio_tokens={} (was_cached={}) delta={}",
+            num_audio_tokens,
+            state.audio_tokens_in_cache,
+            num_audio_tokens as i64 - state.audio_tokens_in_cache as i64
+        );
+
+        // Build stable audio embeddings: reuse cached embeddings for
+        // previously-seen tokens to avoid Conv2d batch-size-dependent
+        // numerical differences (~1e-7) that get amplified through 28
+        // decoder layers and invalidate the cached KV.
+        let audio_embeds = if let Some(ref cached) = state.cached_audio_embeds {
+            let old_audio = state.audio_tokens_in_cache;
+            if old_audio > 0 && old_audio < num_audio_tokens {
+                // Concat: cached[:old_audio] + new[old_audio..]
+                let old_part = cached.narrow(0, 0, old_audio as i64);
+                let new_part =
+                    audio_embeds.narrow(0, old_audio as i64, (num_audio_tokens - old_audio) as i64);
+                let stable = Tensor::cat(&[old_part, new_part], 0);
+                stable.eval();
+                stable
+            } else {
+                audio_embeds
+            }
+        } else {
+            audio_embeds
+        };
+        // Cache current embeddings for next call.
+        state.cached_audio_embeds = Some(audio_embeds.shallow_clone());
+
+        let text_config = &self.config.thinker_config.text_config;
+
+        // Step 2: Prefill — get logits at the last position
+        let logits = if state.kv_cache.is_none() {
+            // First call: full prefill
+            self.streaming_full_prefill(&audio_embeds, num_audio_tokens, state, text_config)?
+        } else {
+            // Incremental: take KV cache out of state to avoid double borrow
+            let mut kv_cache = state.kv_cache.take().unwrap();
+            let result = self.streaming_incremental_prefill(
+                &audio_embeds,
+                num_audio_tokens,
+                &mut kv_cache,
+                state,
+                text_config,
+            );
+            state.kv_cache = Some(kv_cache);
+            let inc_logits = result?;
+
+            // DIAGNOSTIC: compare incremental logits vs fresh full-prefill logits.
+            // Enabled via ASR_VERIFY_INCREMENTAL=1. Does NOT modify state.
+            if std::env::var("ASR_VERIFY_INCREMENTAL").as_deref() == Ok("1") {
+                self.verify_incremental_vs_fresh(
+                    &audio_embeds,
+                    num_audio_tokens,
+                    state,
+                    text_config,
+                    &inc_logits,
+                );
+            }
+
+            inc_logits
+        };
+
+        // Step 3: Autoregressive decode
+        let kv_cache = state.kv_cache.as_mut().unwrap();
+        let seq_len = state.cache_seq_len;
+        let max_new_tokens: usize = 256;
+        let eos_token_ids = vec![ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID];
+
+        // logits has shape (1, num_prefilled, vocab_size). We need the last one.
+        let logits_seq_len = logits.size()[1];
+        let mut next_logits = logits.narrow(1, logits_seq_len - 1, 1).squeeze_dim(1);
+        let mut current_pos = seq_len;
+        let mut generated_ids: Vec<i64> = Vec::new();
+
+        for _ in 0..max_new_tokens {
+            let next_token = next_logits.argmax(-1, false).int64_value(&[0]);
+            if eos_token_ids.contains(&next_token) {
+                break;
+            }
+            generated_ids.push(next_token);
+
+            let next_input = Tensor::from_slice_i64(&[next_token]).to_device(state.device);
+            let next_hidden = self.text_decoder.embed(&next_input).unsqueeze(0);
+            let new_cos = state.cos.narrow(0, current_pos, 1);
+            let new_sin = state.sin.narrow(0, current_pos, 1);
+
+            next_logits =
+                self.text_decoder
+                    .forward(&next_hidden, &new_cos, &new_sin, kv_cache, None);
+            next_logits = next_logits.squeeze_dim(1);
+            next_logits.eval();
+            current_pos += 1;
+        }
+
+        tracing::info!("Streaming: generated {} tokens", generated_ids.len());
+
+        // DIAGNOSTIC: after decode, compare KV cache against fresh prefill.
+        // This shows whether decode corrupts earlier K cache positions.
+        if std::env::var("ASR_VERIFY_POST_DECODE").as_deref() == Ok("1") {
+            self.verify_post_decode(&audio_embeds, num_audio_tokens, state, text_config);
+        }
+
+        // Cleanup
+        #[cfg(feature = "mlx")]
+        {
+            crate::backend::mlx::stream::synchronize();
+            crate::backend::mlx::stream::clear_cache();
+        }
+
+        let raw_text = self.tokenizer.decode(&generated_ids)?;
+        let (language_detected, transcription) = parse_asr_output(&raw_text, false);
+
+        Ok(TranscribeResult {
+            text: transcription,
+            language: language_detected,
+            raw_output: raw_text,
+            duration_seconds,
+        })
+    }
+
+    /// First call: full prefill from scratch. Returns logits for all positions.
+    fn streaming_full_prefill(
+        &self,
+        audio_embeds: &Tensor,
+        num_audio_tokens: usize,
+        state: &mut StreamingState,
+        text_config: &crate::config::TextDecoderConfig,
+    ) -> Result<Tensor> {
+        let seq_len = PRE_AUDIO_TOKEN_COUNT + num_audio_tokens + POST_AUDIO_TOKENS.len();
+
+        // Build hidden states: pre_audio + audio + post_audio
+        let mut hidden_states = state.pre_audio_embeds.shallow_clone();
+
+        // Inject audio embeddings
+        for i in 0..num_audio_tokens {
+            let embed = audio_embeds.get(i as i64);
+            hidden_states = hidden_states.slice_scatter(
+                &embed.unsqueeze(0).unsqueeze(0),
+                1,
+                (PRE_AUDIO_TOKEN_COUNT + i) as i64,
+                (PRE_AUDIO_TOKEN_COUNT + i + 1) as i64,
+                1,
+            );
+            if i % 32 == 31 {
+                hidden_states.eval();
+            }
+        }
+
+        // Append post-audio tokens
+        let post_tensor = Tensor::from_slice_i64(POST_AUDIO_TOKENS).to_device(state.device);
+        let post_embeds = self.text_decoder.embed(&post_tensor).unsqueeze(0);
+        hidden_states = Tensor::cat(&[hidden_states, post_embeds], 1);
+        hidden_states.eval();
+
+        // Cos/sin + mask for full prefill
+        let cos = state.cos.narrow(0, 0, seq_len as i64);
+        let sin = state.sin.narrow(0, 0, seq_len as i64);
+        let mask = create_causal_mask(seq_len as i64, 0, state.device);
+
+        let mut kv_cache = KvCache::new(text_config.num_hidden_layers);
+        let logits =
+            self.text_decoder
+                .forward(&hidden_states, &cos, &sin, &mut kv_cache, Some(&mask));
+        logits.eval();
+
+        state.kv_cache = Some(kv_cache);
+        state.audio_tokens_in_cache = num_audio_tokens;
+        state.cache_seq_len = seq_len as i64;
+
+        Ok(logits)
+    }
+
+    /// Incremental call: reuse KV cache, only prefill new tokens.
+    /// Returns logits for the last position.
+    fn streaming_incremental_prefill(
+        &self,
+        audio_embeds: &Tensor,
+        num_audio_tokens: usize,
+        kv_cache: &mut KvCache,
+        state: &mut StreamingState,
+        text_config: &crate::config::TextDecoderConfig,
+    ) -> Result<Tensor> {
+        let old_audio = state.audio_tokens_in_cache;
+        let _ = text_config;
+
+        tracing::debug!(
+            "[streaming-inc] old_audio={} new_audio={} cache_seq_len={}",
+            old_audio,
+            num_audio_tokens,
+            state.cache_seq_len
+        );
+
+        if num_audio_tokens <= old_audio {
+            // No new audio — still need to return logits for decode.
+            // Truncate to pre_audio + old_audio, re-prefill post_audio.
+            // This handles the case where audio didn't grow.
+            let truncate_len = (PRE_AUDIO_TOKEN_COUNT + old_audio) as i64;
+            kv_cache.truncate(truncate_len);
+            state.cache_seq_len = truncate_len;
+            return self.prefill_post_audio(kv_cache, state, num_audio_tokens);
+        }
+
+        // Step 1: Truncate KV cache to remove old post-audio tokens.
+        // Keep: pre_audio(9) + old_audio(N_old)
+        let truncate_len = (PRE_AUDIO_TOKEN_COUNT + old_audio) as i64;
+        kv_cache.truncate(truncate_len);
+        state.cache_seq_len = truncate_len;
+
+        // DIAGNOSTIC: right after truncate, compare the truncated K cache
+        // against a fresh full prefill's K cache at the same positions.
+        // This isolates whether truncate itself corrupts data.
+        if std::env::var("ASR_VERIFY_TRUNCATE").as_deref() == Ok("1") {
+            self.verify_truncated_k(
+                audio_embeds,
+                num_audio_tokens,
+                kv_cache,
+                state,
+                text_config,
+                truncate_len,
+            );
+        }
+
+        // Step 2+3: Prefill new audio tokens + post-audio tokens in a
+        // single forward call. This avoids potential numerical differences
+        // from splitting the prefill into two calls.
+        let num_new = num_audio_tokens - old_audio;
+        let pos_start = (PRE_AUDIO_TOKEN_COUNT + old_audio) as i64;
+        let total_new = num_new + POST_AUDIO_TOKENS.len();
+
+        tracing::debug!(
+            "[streaming-inc] truncate_len={} num_new={} pos_start={} total_new={}",
+            truncate_len,
+            num_new,
+            pos_start,
+            total_new
+        );
+
+        // Build hidden states: new audio embeds + post-audio embeds
+        let mut parts: Vec<Tensor> = Vec::with_capacity(total_new);
+        for i in old_audio..num_audio_tokens {
+            parts.push(audio_embeds.get(i as i64).unsqueeze(0).unsqueeze(0));
+        }
+        let post_tensor = Tensor::from_slice_i64(POST_AUDIO_TOKENS).to_device(state.device);
+        let post_embeds = self.text_decoder.embed(&post_tensor).unsqueeze(0);
+        parts.push(post_embeds);
+        let new_hidden = Tensor::cat(&parts, 1); // (1, total_new, dim)
+
+        let cos = state.cos.narrow(0, pos_start, total_new as i64);
+        let sin = state.sin.narrow(0, pos_start, total_new as i64);
+        let mask = create_causal_mask(total_new as i64, truncate_len, state.device);
+
+        let logits = self
+            .text_decoder
+            .forward(&new_hidden, &cos, &sin, kv_cache, Some(&mask));
+        logits.eval();
+        state.cache_seq_len += total_new as i64;
+        state.audio_tokens_in_cache = num_audio_tokens;
+
+        Ok(logits)
+    }
+
+    /// Diagnostic: compare incremental prefill logits against a fresh
+    /// full prefill. Logs max abs diff per layer's K cache and the final
+    /// logits. Does NOT modify `state`.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_incremental_vs_fresh(
+        &self,
+        audio_embeds: &Tensor,
+        num_audio_tokens: usize,
+        state: &StreamingState,
+        text_config: &crate::config::TextDecoderConfig,
+        inc_logits: &Tensor,
+    ) {
+        // Build a fresh full prefill in a temporary state clone.
+        let seq_len = PRE_AUDIO_TOKEN_COUNT + num_audio_tokens + POST_AUDIO_TOKENS.len();
+
+        let mut hidden_states = state.pre_audio_embeds.shallow_clone();
+        for i in 0..num_audio_tokens {
+            let embed = audio_embeds.get(i as i64);
+            hidden_states = hidden_states.slice_scatter(
+                &embed.unsqueeze(0).unsqueeze(0),
+                1,
+                (PRE_AUDIO_TOKEN_COUNT + i) as i64,
+                (PRE_AUDIO_TOKEN_COUNT + i + 1) as i64,
+                1,
+            );
+            if i % 32 == 31 {
+                hidden_states.eval();
+            }
+        }
+        let post_tensor = Tensor::from_slice_i64(POST_AUDIO_TOKENS).to_device(state.device);
+        let post_embeds = self.text_decoder.embed(&post_tensor).unsqueeze(0);
+        hidden_states = Tensor::cat(&[hidden_states, post_embeds], 1);
+        hidden_states.eval();
+
+        let cos = state.cos.narrow(0, 0, seq_len as i64);
+        let sin = state.sin.narrow(0, 0, seq_len as i64);
+        let mask = create_causal_mask(seq_len as i64, 0, state.device);
+
+        let mut fresh_cache = KvCache::new(text_config.num_hidden_layers);
+        let fresh_logits =
+            self.text_decoder
+                .forward(&hidden_states, &cos, &sin, &mut fresh_cache, Some(&mask));
+        fresh_logits.eval();
+
+        // Compare logits: incremental returned (1, post_len, vocab) for the
+        // last segment only; fresh returned (1, seq_len, vocab). Compare the
+        // last position of each.
+        let inc_last = inc_logits
+            .narrow(1, inc_logits.size()[1] - 1, 1)
+            .squeeze_dim(1);
+        let fresh_last = fresh_logits
+            .narrow(1, fresh_logits.size()[1] - 1, 1)
+            .squeeze_dim(1);
+        let diff = (&inc_last - &fresh_last).abs();
+        let max_diff = diff.max().f64_value(&[]);
+
+        // Also compare per-layer K cache at the first truncate_len positions.
+        let inc_cache = state.kv_cache.as_ref().unwrap();
+        let mut layer_max_diffs: Vec<f64> = Vec::new();
+        for i in 0..text_config.num_hidden_layers {
+            let (inc_k, _inc_v) = inc_cache.get(i).unwrap();
+            let (fresh_k, _fresh_v) = fresh_cache.get(i).unwrap();
+            // Both should have the same seq_len now.
+            let cmp_len = inc_k.size()[2].min(fresh_k.size()[2]);
+            let inc_k_part = inc_k.narrow(2, 0, cmp_len);
+            let fresh_k_part = fresh_k.narrow(2, 0, cmp_len);
+            let kdiff = (&inc_k_part - &fresh_k_part).abs().max().f64_value(&[]);
+            layer_max_diffs.push(kdiff);
+        }
+        let k_max = layer_max_diffs.iter().cloned().fold(0.0f64, f64::max);
+
+        // Per-segment K cache diff on layer 0: pre_audio / old_audio / new_audio / post_audio.
+        let (inc_k0, _) = inc_cache.get(0).unwrap();
+        let (fresh_k0, _) = fresh_cache.get(0).unwrap();
+        let seg_diff = |start: i64, end: i64| -> f64 {
+            if end <= start {
+                return 0.0;
+            }
+            let len = end - start;
+            let inc_seg = inc_k0.narrow(2, start, len);
+            let fresh_seg = fresh_k0.narrow(2, start, len);
+            (&inc_seg - &fresh_seg).abs().max().f64_value(&[])
+        };
+        let pre_diff = seg_diff(0, PRE_AUDIO_TOKEN_COUNT as i64);
+        let old_audio_diff = seg_diff(
+            PRE_AUDIO_TOKEN_COUNT as i64,
+            (PRE_AUDIO_TOKEN_COUNT + state.audio_tokens_in_cache) as i64,
+        );
+        let total_len = inc_k0.size()[2];
+        let seg_total_diff = seg_diff(0, total_len);
+
+        // argmax of last position
+        let inc_argmax = inc_last.argmax(-1, false).int64_value(&[0]);
+        let fresh_argmax = fresh_last.argmax(-1, false).int64_value(&[0]);
+
+        tracing::warn!(
+            "[verify] logits_max_diff={:.3e} k_cache_max_diff={:.3e} inc_argmax={} fresh_argmax={} match={}",
+            max_diff,
+            k_max,
+            inc_argmax,
+            fresh_argmax,
+            inc_argmax == fresh_argmax
+        );
+        tracing::warn!(
+            "[verify] layer0 K seg diffs: pre_audio={:.3e} old_audio={:.3e} total={:.3e} (cache_len={} fresh_len={})",
+            pre_diff,
+            old_audio_diff,
+            seg_total_diff,
+            total_len,
+            fresh_k0.size()[2]
+        );
+
+        // Free the fresh computation graph.
+        drop(fresh_cache);
+        drop(fresh_logits);
+        #[cfg(feature = "mlx")]
+        {
+            crate::backend::mlx::stream::synchronize();
+            crate::backend::mlx::stream::clear_cache();
+        }
+    }
+
+    /// Diagnostic: compare truncated K cache against fresh full prefill K
+    /// at positions 0..truncate_len. Run BEFORE any new prefill.
+    fn verify_truncated_k(
+        &self,
+        audio_embeds: &Tensor,
+        num_audio_tokens: usize,
+        kv_cache: &KvCache,
+        state: &StreamingState,
+        text_config: &crate::config::TextDecoderConfig,
+        truncate_len: i64,
+    ) {
+        let seq_len = PRE_AUDIO_TOKEN_COUNT + num_audio_tokens + POST_AUDIO_TOKENS.len();
+        let mut hidden_states = state.pre_audio_embeds.shallow_clone();
+        for i in 0..num_audio_tokens {
+            let embed = audio_embeds.get(i as i64);
+            hidden_states = hidden_states.slice_scatter(
+                &embed.unsqueeze(0).unsqueeze(0),
+                1,
+                (PRE_AUDIO_TOKEN_COUNT + i) as i64,
+                (PRE_AUDIO_TOKEN_COUNT + i + 1) as i64,
+                1,
+            );
+            if i % 32 == 31 {
+                hidden_states.eval();
+            }
+        }
+        let post_tensor = Tensor::from_slice_i64(POST_AUDIO_TOKENS).to_device(state.device);
+        let post_embeds = self.text_decoder.embed(&post_tensor).unsqueeze(0);
+        hidden_states = Tensor::cat(&[hidden_states, post_embeds], 1);
+        hidden_states.eval();
+        let cos = state.cos.narrow(0, 0, seq_len as i64);
+        let sin = state.sin.narrow(0, 0, seq_len as i64);
+        let mask = create_causal_mask(seq_len as i64, 0, state.device);
+        let mut fresh_cache = KvCache::new(text_config.num_hidden_layers);
+        let fresh_logits =
+            self.text_decoder
+                .forward(&hidden_states, &cos, &sin, &mut fresh_cache, Some(&mask));
+        fresh_logits.eval();
+
+        let (inc_k, _) = kv_cache.get(0).unwrap();
+        let (fresh_k, _) = fresh_cache.get(0).unwrap();
+        let inc_len = inc_k.size()[2];
+        let fresh_len = fresh_k.size()[2];
+
+        let seg_diff = |start: i64, end: i64| -> f64 {
+            if end <= start || end > inc_len.min(fresh_len) {
+                return -1.0;
+            }
+            let len = end - start;
+            let inc_seg = inc_k.narrow(2, start, len);
+            let fresh_seg = fresh_k.narrow(2, start, len);
+            (&inc_seg - &fresh_seg).abs().max().f64_value(&[])
+        };
+
+        let pre_d = seg_diff(0, PRE_AUDIO_TOKEN_COUNT as i64);
+        let old_d = seg_diff(PRE_AUDIO_TOKEN_COUNT as i64, truncate_len);
+        let all_d = seg_diff(0, inc_len.min(fresh_len));
+
+        // CRITICAL TEST: compare fresh prefill K at positions 9..truncate_len
+        // against a SEPARATE fresh prefill using ONLY old_audio tokens (not
+        // the full num_audio_tokens). If K values differ, it means K depends
+        // on sequence length — which would invalidate incremental prefill.
+        let old_audio_count = (truncate_len - PRE_AUDIO_TOKEN_COUNT as i64) as usize;
+        let short_seq_len = PRE_AUDIO_TOKEN_COUNT + old_audio_count + POST_AUDIO_TOKENS.len();
+        let mut short_hidden = state.pre_audio_embeds.shallow_clone();
+        for i in 0..old_audio_count {
+            let embed = audio_embeds.get(i as i64);
+            short_hidden = short_hidden.slice_scatter(
+                &embed.unsqueeze(0).unsqueeze(0),
+                1,
+                (PRE_AUDIO_TOKEN_COUNT + i) as i64,
+                (PRE_AUDIO_TOKEN_COUNT + i + 1) as i64,
+                1,
+            );
+        }
+        let short_post = Tensor::from_slice_i64(POST_AUDIO_TOKENS).to_device(state.device);
+        let short_post_embeds = self.text_decoder.embed(&short_post).unsqueeze(0);
+        short_hidden = Tensor::cat(&[short_hidden, short_post_embeds], 1);
+        short_hidden.eval();
+        let short_cos = state.cos.narrow(0, 0, short_seq_len as i64);
+        let short_sin = state.sin.narrow(0, 0, short_seq_len as i64);
+        let short_mask = create_causal_mask(short_seq_len as i64, 0, state.device);
+        let mut short_cache = KvCache::new(text_config.num_hidden_layers);
+        let short_logits = self.text_decoder.forward(
+            &short_hidden,
+            &short_cos,
+            &short_sin,
+            &mut short_cache,
+            Some(&short_mask),
+        );
+        short_logits.eval();
+
+        // Compare short fresh prefill K vs long fresh prefill K at positions 9..truncate_len.
+        let (short_k, _) = short_cache.get(0).unwrap();
+        let short_len = short_k.size()[2];
+        let k_seg_diff = |start: i64, end: i64| -> f64 {
+            let len = end - start;
+            let s = short_k.narrow(2, start, len);
+            let f = fresh_k.narrow(2, start, len);
+            (&s - &f).abs().max().f64_value(&[])
+        };
+        let short_vs_long_pre = k_seg_diff(0, PRE_AUDIO_TOKEN_COUNT as i64);
+        let short_vs_long_audio = k_seg_diff(
+            PRE_AUDIO_TOKEN_COUNT as i64,
+            truncate_len.min(short_len).min(fresh_len),
+        );
+
+        // Also compare truncated state K vs short fresh K (should match if
+        // state K was correctly computed from the short prefill).
+        let state_vs_short_audio = {
+            let len = truncate_len.min(short_len).min(inc_len);
+            let s = inc_k.narrow(
+                2,
+                PRE_AUDIO_TOKEN_COUNT as i64,
+                len - PRE_AUDIO_TOKEN_COUNT as i64,
+            );
+            let f = short_k.narrow(
+                2,
+                PRE_AUDIO_TOKEN_COUNT as i64,
+                len - PRE_AUDIO_TOKEN_COUNT as i64,
+            );
+            (&s - &f).abs().max().f64_value(&[])
+        };
+
+        tracing::warn!(
+            "[verify-trunc] inc_k_len={} fresh_k_len={} trunc_len={} pre_diff={:.3e} old_audio_diff={:.3e} all_diff={:.3e}",
+            inc_len,
+            fresh_len,
+            truncate_len,
+            pre_d,
+            old_d,
+            all_d
+        );
+        tracing::warn!(
+            "[verify-trunc] short_fresh_k_len={} short_vs_long pre={:.3e} audio={:.3e} | state_vs_short_audio={:.3e}",
+            short_len,
+            short_vs_long_pre,
+            short_vs_long_audio,
+            state_vs_short_audio
+        );
+
+        drop(fresh_cache);
+        drop(fresh_logits);
+        #[cfg(feature = "mlx")]
+        {
+            crate::backend::mlx::stream::synchronize();
+            crate::backend::mlx::stream::clear_cache();
+        }
+    }
+
+    fn verify_post_decode(
+        &self,
+        audio_embeds: &Tensor,
+        num_audio_tokens: usize,
+        state: &StreamingState,
+        text_config: &crate::config::TextDecoderConfig,
+    ) {
+        let seq_len = PRE_AUDIO_TOKEN_COUNT + num_audio_tokens + POST_AUDIO_TOKENS.len();
+        let mut hidden_states = state.pre_audio_embeds.shallow_clone();
+        for i in 0..num_audio_tokens {
+            let embed = audio_embeds.get(i as i64);
+            hidden_states = hidden_states.slice_scatter(
+                &embed.unsqueeze(0).unsqueeze(0),
+                1,
+                (PRE_AUDIO_TOKEN_COUNT + i) as i64,
+                (PRE_AUDIO_TOKEN_COUNT + i + 1) as i64,
+                1,
+            );
+            if i % 32 == 31 {
+                hidden_states.eval();
+            }
+        }
+        let post_tensor = Tensor::from_slice_i64(POST_AUDIO_TOKENS).to_device(state.device);
+        let post_embeds = self.text_decoder.embed(&post_tensor).unsqueeze(0);
+        hidden_states = Tensor::cat(&[hidden_states, post_embeds], 1);
+        hidden_states.eval();
+        let cos = state.cos.narrow(0, 0, seq_len as i64);
+        let sin = state.sin.narrow(0, 0, seq_len as i64);
+        let mask = create_causal_mask(seq_len as i64, 0, state.device);
+        let mut fresh_cache = KvCache::new(text_config.num_hidden_layers);
+        let fresh_logits =
+            self.text_decoder
+                .forward(&hidden_states, &cos, &sin, &mut fresh_cache, Some(&mask));
+        fresh_logits.eval();
+
+        let inc_cache = state.kv_cache.as_ref().unwrap();
+        let (inc_k, _) = inc_cache.get(0).unwrap();
+        let (fresh_k, _) = fresh_cache.get(0).unwrap();
+        let inc_len = inc_k.size()[2];
+        let fresh_len = fresh_k.size()[2];
+        let cmp_len = (seq_len as i64).min(inc_len).min(fresh_len);
+        let seg_diff = |start: i64, end: i64| -> f64 {
+            if end <= start || end > cmp_len {
+                return -1.0;
+            }
+            let len = end - start;
+            let inc_seg = inc_k.narrow(2, start, len);
+            let fresh_seg = fresh_k.narrow(2, start, len);
+            (&inc_seg - &fresh_seg).abs().max().f64_value(&[])
+        };
+        let pre_d = seg_diff(0, PRE_AUDIO_TOKEN_COUNT as i64);
+        let audio_d = seg_diff(
+            PRE_AUDIO_TOKEN_COUNT as i64,
+            (PRE_AUDIO_TOKEN_COUNT + num_audio_tokens) as i64,
+        );
+        let post_d = seg_diff(
+            (PRE_AUDIO_TOKEN_COUNT + num_audio_tokens) as i64,
+            seq_len as i64,
+        );
+        let all_prefill_d = seg_diff(0, cmp_len);
+        tracing::warn!(
+            "[verify-post-decode] inc_k_len={} fresh_k_len={} pre_diff={:.3e} audio_diff={:.3e} post_diff={:.3e} all_prefill_diff={:.3e}",
+            inc_len,
+            fresh_len,
+            pre_d,
+            audio_d,
+            post_d,
+            all_prefill_d
+        );
+        drop(fresh_cache);
+        drop(fresh_logits);
+        #[cfg(feature = "mlx")]
+        {
+            crate::backend::mlx::stream::synchronize();
+            crate::backend::mlx::stream::clear_cache();
+        }
+    }
+
+    /// Prefill the post-audio tokens (audio_end, im_end, assistant, \n).
+    /// Returns logits from the last position.
+    fn prefill_post_audio(
+        &self,
+        kv_cache: &mut KvCache,
+        state: &mut StreamingState,
+        num_audio_tokens: usize,
+    ) -> Result<Tensor> {
+        let post_tensor = Tensor::from_slice_i64(POST_AUDIO_TOKENS).to_device(state.device);
+        let post_hidden = self.text_decoder.embed(&post_tensor).unsqueeze(0);
+
+        let post_pos_start = (PRE_AUDIO_TOKEN_COUNT + num_audio_tokens) as i64;
+        let cos = state
+            .cos
+            .narrow(0, post_pos_start, POST_AUDIO_TOKENS.len() as i64);
+        let sin = state
+            .sin
+            .narrow(0, post_pos_start, POST_AUDIO_TOKENS.len() as i64);
+        let mask = create_causal_mask(
+            POST_AUDIO_TOKENS.len() as i64,
+            state.cache_seq_len,
+            state.device,
+        );
+
+        let logits = self
+            .text_decoder
+            .forward(&post_hidden, &cos, &sin, kv_cache, Some(&mask));
+        logits.eval();
+        state.cache_seq_len += POST_AUDIO_TOKENS.len() as i64;
+        state.audio_tokens_in_cache = num_audio_tokens;
+
+        Ok(logits)
+    }
+}
+
 fn parse_asr_output(raw: &str, language_forced: bool) -> (String, String) {
     if language_forced {
         return ("forced".to_string(), raw.trim().to_string());

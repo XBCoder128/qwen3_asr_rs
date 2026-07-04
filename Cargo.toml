@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "asr-server"
 path = "src/bin/server.rs"
 
+[[bin]]
+name = "test_streaming"
+path = "src/bin/test_streaming.rs"
+
 [dependencies]
 tch = { version = "0.20", optional = true }
 tokenizers = "0.21"

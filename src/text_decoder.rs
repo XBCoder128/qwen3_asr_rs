@@ -1,6 +1,6 @@
+use crate::tensor::{DType, Device, Tensor};
 use anyhow::Result;
 use std::collections::HashMap;
-use crate::tensor::{DType, Device, Tensor};
 
 use crate::config::TextDecoderConfig;
 use crate::layers::{RmsNorm, TextDecoderLayer};
@@ -33,6 +33,20 @@ impl KvCache {
             .as_ref()
             .map(|(k, _)| k.size()[2])
             .unwrap_or(0)
+    }
+
+    /// Truncate the KV cache to `new_seq_len` positions along the sequence
+    /// dimension (dim 2). Used in incremental streaming to remove stale
+    /// post-audio tokens (audio_end, im_end, assistant) before appending
+    /// new audio tokens at their new positions.
+    pub fn truncate(&mut self, new_seq_len: i64) {
+        for layer in &mut self.layers {
+            if let Some((k, v)) = layer {
+                let k_new = k.narrow(2, 0, new_seq_len);
+                let v_new = v.narrow(2, 0, new_seq_len);
+                *layer = Some((k_new, v_new));
+            }
+        }
     }
 }
 
@@ -68,10 +82,7 @@ impl TextDecoder {
 
         let norm = RmsNorm::load(weights, &format!("{}.norm", prefix), config.rms_norm_eps)?;
 
-        let lm_head_key = format!(
-            "{}",
-            prefix.replace(".model", ".lm_head")
-        );
+        let lm_head_key = format!("{}", prefix.replace(".model", ".lm_head"));
         let lm_head_weight = if config.tie_word_embeddings {
             embed_tokens.shallow_clone()
         } else {
