@@ -449,18 +449,36 @@ impl AsrInference {
     ) -> Result<TranscribeResult> {
         let duration_seconds = samples.len() as f64 / MEL_SAMPLE_RATE as f64;
         let chunk_size = self.audio_encoder.chunk_size();
+        let tokens_per_chunk = self.audio_encoder.tokens_per_chunk();
+
+        let t_start = std::time::Instant::now();
 
         // Step 1: Compute mel
         let mel = self.mel_extractor.extract(samples, self.device)?;
         let total_mel_frames = mel.size()[1] as usize;
 
-        // Only process complete chunks during streaming partials.
-        // The final transcription (allow_tail=true) processes everything.
+        // Determine how many frames to process.
+        // - allow_tail=true (final): process all frames.
+        // - allow_tail=false (partial): process up to the last complete chunk
+        //   boundary, OR all frames if there's no tail (naturally aligned).
+        let full_frames = (total_mel_frames / chunk_size) * chunk_size;
         let mel_frames_to_use = if allow_tail {
             total_mel_frames
         } else {
-            (total_mel_frames / chunk_size) * chunk_size
+            full_frames
         };
+
+        // Skip if no new frames to process.
+        if mel_frames_to_use == 0 || (mel_frames_to_use <= state.cached_mel_frames && !allow_tail) {
+            // Nothing new to encode. Return empty result.
+            return Ok(TranscribeResult {
+                text: String::new(),
+                language: String::new(),
+                raw_output: String::new(),
+                duration_seconds,
+            });
+        }
+
         let mel = if mel_frames_to_use < total_mel_frames {
             mel.narrow(1, 0, mel_frames_to_use as i64)
         } else {
@@ -468,13 +486,13 @@ impl AsrInference {
         };
         let total_mel_frames = mel_frames_to_use;
 
-        // Step 2: Incremental encoding — only encode new mel frames.
+        // Step 2: Incremental encoding.
         //
-        // chunk_local is enabled by init_streaming(), so each chunk is
-        // encoded independently and we can safely encode only the new
-        // frames and concatenate.
-        let tokens_per_chunk = self.audio_encoder.tokens_per_chunk();
-
+        // cached_audio_embeds holds embeddings for frames [0..cached_mel_frames)
+        // which are all complete chunks. We encode frames
+        // [cached_mel_frames..total_mel_frames) (which may include the old
+        // tail being re-encoded + new frames), concatenate, then update the
+        // cache to the new complete-chunk boundary.
         let audio_embeds =
             if state.cached_mel_frames > 0 && state.cached_mel_frames < total_mel_frames {
                 let new_frame_start = state.cached_mel_frames;
@@ -487,18 +505,25 @@ impl AsrInference {
                 let combined = Tensor::cat(&[cached.shallow_clone(), new_embeds], 0);
                 combined.eval();
 
-                // All frames are complete chunks — cache everything.
-                state.cached_audio_embeds = Some(combined.shallow_clone());
-                state.cached_mel_frames = total_mel_frames;
+                // Update cache to the new complete-chunk boundary.
+                let new_full_frames = (total_mel_frames / chunk_size) * chunk_size;
+                let new_full_chunks = new_full_frames / chunk_size;
+                let new_full_tokens = new_full_chunks * tokens_per_chunk;
+                state.cached_audio_embeds = Some(combined.narrow(0, 0, new_full_tokens as i64));
+                state.cached_mel_frames = new_full_frames;
                 combined
             } else {
                 let embeds = self.audio_encoder.forward(&mel);
                 embeds.eval();
-                state.cached_audio_embeds = Some(embeds.shallow_clone());
-                state.cached_mel_frames = total_mel_frames;
+                let new_full_frames = (total_mel_frames / chunk_size) * chunk_size;
+                let new_full_chunks = new_full_frames / chunk_size;
+                let new_full_tokens = new_full_chunks * tokens_per_chunk;
+                state.cached_audio_embeds = Some(embeds.narrow(0, 0, new_full_tokens as i64));
+                state.cached_mel_frames = new_full_frames;
                 embeds
             };
         let num_audio_tokens = audio_embeds.size()[0] as usize;
+        let t_encode = t_start.elapsed();
 
         tracing::info!(
             "[streaming] audio_tokens={} (was_cached={}) delta={}",
@@ -509,7 +534,7 @@ impl AsrInference {
 
         let text_config = &self.config.thinker_config.text_config;
 
-        // Step 3: Prefill
+        let t_prefill_start = std::time::Instant::now();
         let logits = if state.kv_cache.is_none() {
             // First call: full prefill
             self.streaming_full_prefill(&audio_embeds, num_audio_tokens, state, text_config)?
@@ -526,6 +551,7 @@ impl AsrInference {
             state.kv_cache = Some(kv_cache);
             result?
         };
+        let t_prefill = t_prefill_start.elapsed();
 
         // Step 4: Autoregressive decode
         let kv_cache = state.kv_cache.as_mut().unwrap();
@@ -586,6 +612,15 @@ impl AsrInference {
 
         // Save generated IDs for next call's prefix rollback.
         state.last_generated_ids = generated_ids.clone();
+
+        let t_total = t_start.elapsed();
+        tracing::info!(
+            "[streaming] timing: encode={:.0}ms prefill={:.0}ms decode={:.0}ms total={:.0}ms",
+            t_encode.as_millis(),
+            t_prefill.as_millis(),
+            (t_total - t_encode - t_prefill).as_millis(),
+            t_total.as_millis()
+        );
 
         // Cleanup
         #[cfg(feature = "mlx")]
@@ -651,7 +686,11 @@ impl AsrInference {
         logits.eval();
 
         state.kv_cache = Some(kv_cache);
-        state.audio_tokens_in_cache = num_audio_tokens;
+        // Track only complete-chunk token count (excluding tail) so that
+        // old tail KV gets truncated when tail becomes a full chunk.
+        let tpc = self.audio_encoder.tokens_per_chunk();
+        let fchunks = num_audio_tokens / tpc;
+        state.audio_tokens_in_cache = fchunks * tpc;
         state.cache_seq_len = seq_len as i64;
 
         Ok(logits)
@@ -677,34 +716,18 @@ impl AsrInference {
             state.cache_seq_len
         );
 
-        if num_audio_tokens <= old_audio {
-            // No new audio — still need to return logits for decode.
-            // Truncate to pre_audio + old_audio, re-prefill post_audio.
-            // This handles the case where audio didn't grow.
-            let truncate_len = (PRE_AUDIO_TOKEN_COUNT + old_audio) as i64;
-            kv_cache.truncate(truncate_len);
-            state.cache_seq_len = truncate_len;
-            return self.prefill_post_audio(kv_cache, state, num_audio_tokens);
-        }
-
-        // Step 1: Truncate KV cache to remove old post-audio tokens.
-        // Keep: pre_audio(9) + old_audio(N_old)
+        // Always truncate to pre_audio + old_audio (complete chunks only).
+        // This removes old tail KV + post-audio + generated text,
+        // so we can re-prefill with correct embeddings.
         let truncate_len = (PRE_AUDIO_TOKEN_COUNT + old_audio) as i64;
         kv_cache.truncate(truncate_len);
         state.cache_seq_len = truncate_len;
 
-        // DIAGNOSTIC: right after truncate, compare the truncated K cache
-        // against a fresh full prefill's K cache at the same positions.
-        // This isolates whether truncate itself corrupts data.
-        if std::env::var("ASR_VERIFY_TRUNCATE").as_deref() == Ok("1") {
-            self.verify_truncated_k(
-                audio_embeds,
-                num_audio_tokens,
-                kv_cache,
-                state,
-                text_config,
-                truncate_len,
-            );
+        // Number of new audio tokens to prefill (new complete chunks + tail).
+        let num_new_i64 = num_audio_tokens as i64 - old_audio as i64;
+        if num_new_i64 <= 0 {
+            // No new audio at all — just re-prefill post-audio + prefix.
+            return self.prefill_post_audio(kv_cache, state, num_audio_tokens);
         }
 
         // Step 2+3: Prefill new audio tokens + post-audio tokens + prefix
@@ -761,7 +784,9 @@ impl AsrInference {
             .forward(&new_hidden, &cos, &sin, kv_cache, Some(&mask));
         logits.eval();
         state.cache_seq_len += total_new as i64;
-        state.audio_tokens_in_cache = num_audio_tokens;
+        let tpc = self.audio_encoder.tokens_per_chunk();
+        let fchunks = num_audio_tokens / tpc;
+        state.audio_tokens_in_cache = fchunks * tpc;
 
         Ok(logits)
     }
@@ -1145,7 +1170,9 @@ impl AsrInference {
             .forward(&post_hidden, &cos, &sin, kv_cache, Some(&mask));
         logits.eval();
         state.cache_seq_len += POST_AUDIO_TOKENS.len() as i64;
-        state.audio_tokens_in_cache = num_audio_tokens;
+        let tpc = self.audio_encoder.tokens_per_chunk();
+        let fchunks = num_audio_tokens / tpc;
+        state.audio_tokens_in_cache = fchunks * tpc;
 
         Ok(logits)
     }
