@@ -42,8 +42,10 @@ impl KvCache {
     pub fn truncate(&mut self, new_seq_len: i64) {
         for layer in &mut self.layers {
             if let Some((k, v)) = layer {
-                let k_new = k.narrow(2, 0, new_seq_len);
-                let v_new = v.narrow(2, 0, new_seq_len);
+                let actual_len = k.size()[2];
+                let len = new_seq_len.min(actual_len);
+                let k_new = k.narrow(2, 0, len);
+                let v_new = v.narrow(2, 0, len);
                 *layer = Some((k_new, v_new));
             }
         }

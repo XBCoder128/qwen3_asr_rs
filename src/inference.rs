@@ -750,6 +750,18 @@ impl AsrInference {
         // This removes old tail KV + post-audio + generated text,
         // so we can re-prefill with correct embeddings.
         let truncate_len = (PRE_AUDIO_TOKEN_COUNT + old_audio) as i64;
+        // Safety: clamp truncate_len to the actual KV cache length.
+        // If a previous step was skipped (no new complete chunks), the
+        // KV cache may be shorter than expected.
+        let actual_cache_len = kv_cache.seq_len();
+        let truncate_len = truncate_len.min(actual_cache_len);
+        // Force materialize before truncate to avoid stale lazy graph.
+        for layer in &kv_cache.layers {
+            if let Some((k, v)) = layer {
+                k.eval();
+                v.eval();
+            }
+        }
         kv_cache.truncate(truncate_len);
         state.cache_seq_len = truncate_len;
 
