@@ -397,7 +397,10 @@ impl AsrInference {
             vec![151644, 8948, 198, 151645, 198, 151644, 872, 198, 151669];
 
         // Pre-allocate cos/sin for generous position budget.
-        let max_positions = 1024i64;
+        // Must be large enough for pre_audio(9) + max_audio_tokens +
+        // post_audio(6) + language_prefix + max_generated_text.
+        // For 120s audio: ~1560 audio tokens + 9 + 6 + ~500 text = ~2075.
+        let max_positions = 4096i64;
         let positions: Vec<i64> = (0..max_positions).collect();
         let pos_ids: [Vec<i64>; 3] = [positions.clone(), positions.clone(), positions];
         let (cos, sin) = compute_mrope_cos_sin(
@@ -751,9 +754,13 @@ impl AsrInference {
         // so we can re-prefill with correct embeddings.
         let truncate_len = (PRE_AUDIO_TOKEN_COUNT + old_audio) as i64;
         // Safety: clamp truncate_len to the actual KV cache length.
-        // If a previous step was skipped (no new complete chunks), the
-        // KV cache may be shorter than expected.
         let actual_cache_len = kv_cache.seq_len();
+        if truncate_len > actual_cache_len {
+            tracing::warn!(
+                "[streaming-inc] truncate_len={} > actual_cache_len={}! Clamping. old_audio={} num_audio_tokens={} cache_seq_len={}",
+                truncate_len, actual_cache_len, old_audio, num_audio_tokens, state.cache_seq_len
+            );
+        }
         let truncate_len = truncate_len.min(actual_cache_len);
         // Force materialize before truncate to avoid stale lazy graph.
         for layer in &kv_cache.layers {
@@ -794,6 +801,21 @@ impl AsrInference {
         let total_new =
             num_new + POST_AUDIO_TOKENS.len() + state.language_prefix_ids.len() + prefix_ids.len();
 
+        // Verify all KV cache layers have the same length before prefill.
+        let cache_lens: Vec<i64> = kv_cache
+            .layers
+            .iter()
+            .map(|l| l.as_ref().map(|(k, _)| k.size()[2]).unwrap_or(0))
+            .collect();
+        let max_len = *cache_lens.iter().max().unwrap_or(&0);
+        let min_len = *cache_lens.iter().min().unwrap_or(&0);
+        if max_len != min_len {
+            tracing::warn!(
+                "[streaming-inc] KV cache layer length mismatch! min={} max={} truncate_len={} total_new={}",
+                min_len, max_len, truncate_len, total_new
+            );
+        }
+
         tracing::debug!(
             "[streaming-inc] truncate_len={} num_new={} pos_start={} total_new={} prefix={} lang={}",
             truncate_len,
@@ -829,10 +851,39 @@ impl AsrInference {
         let sin = state.sin.narrow(0, pos_start, total_new as i64);
         let mask = create_causal_mask(total_new as i64, truncate_len, state.device);
 
+        // Pre-forward diagnostics.
+        tracing::info!(
+            "[streaming-inc] pre-forward: total_new={} truncate_len={} kv_len={} mask_dims={:?} hidden_dims={:?}",
+            total_new,
+            truncate_len,
+            kv_cache.seq_len(),
+            mask.size(),
+            new_hidden.size()
+        );
+
         let logits = self
             .text_decoder
             .forward(&new_hidden, &cos, &sin, kv_cache, Some(&mask));
         logits.eval();
+
+        // Verify KV cache consistency after forward.
+        let post_lens: Vec<i64> = kv_cache
+            .layers
+            .iter()
+            .map(|l| l.as_ref().map(|(k, _)| k.size()[2]).unwrap_or(0))
+            .collect();
+        let post_max = *post_lens.iter().max().unwrap_or(&0);
+        let post_min = *post_lens.iter().min().unwrap_or(&0);
+        if post_max != post_min {
+            tracing::warn!(
+                "[streaming-inc] POST-FORWARD KV mismatch! min={} max={} truncate={} total_new={}",
+                post_min,
+                post_max,
+                truncate_len,
+                total_new
+            );
+        }
+
         state.cache_seq_len += total_new as i64;
         let tpc = self.audio_encoder.tokens_per_chunk();
         let fchunks = num_audio_tokens / tpc;
