@@ -72,9 +72,14 @@ fn main() -> Result<()> {
             continue;
         }
 
-        let result = model
-            .streaming_transcribe(&accumulated, &mut stream_state)
-            .with_context(|| format!("Failed at chunk {}", i + 1))?;
+        // Use partial (no tail) for intermediate steps.
+        let is_last = i == num_chunks - 1;
+        let result = if is_last {
+            model.streaming_transcribe(&accumulated, &mut stream_state)
+        } else {
+            model.streaming_transcribe_partial(&accumulated, &mut stream_state)
+        }
+        .with_context(|| format!("Failed at chunk {}", i + 1))?;
 
         let acc_dur = accumulated.len() as f64 / SAMPLE_RATE as f64;
         eprintln!("[chunk {}] {:.1}s → {}", i + 1, acc_dur, result.text);
