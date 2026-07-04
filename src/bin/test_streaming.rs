@@ -4,14 +4,14 @@
 //! as offline (full audio) transcription.
 //!
 //! Usage:
-//!   cargo run --release --no-default-features --features mlx --bin test_streaming -- <model_dir> <audio_file> [chunk_sec]
+//!   cargo run --release --no-default-features --features mlx --bin test_streaming -- <model_dir> <audio_file> [chunk_sec] [rollback_tokens]
 //!
 //! The test runs three modes:
 //!   1. Offline: full audio → transcribe_samples (ground truth)
 //!   2. Streaming (re-transcribe): chunks → transcribe_samples each time (O(n²))
 //!   3. Streaming (incremental): chunks → streaming_transcribe (O(n), KV cache reuse)
 //!
-//! All three should produce identical text.
+//! All three should produce identical text when rollback_tokens=0.
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -40,12 +40,14 @@ fn main() -> Result<()> {
         eprintln!("  model_dir   Path to Qwen3-ASR model directory");
         eprintln!("  audio_file  Path to test audio file");
         eprintln!("  chunk_sec   Chunk size in seconds (default: 2.0)");
+        eprintln!("  rollback_tokens  Number of trailing tokens to re-decode (default: 0)");
         std::process::exit(1);
     }
 
     let model_dir = Path::new(&args[1]);
     let audio_file = &args[2];
     let chunk_sec: f64 = args.get(3).map(|s| s.parse().unwrap_or(2.0)).unwrap_or(2.0);
+    let rollback: usize = args.get(4).map(|s| s.parse().unwrap_or(0)).unwrap_or(0);
 
     #[cfg(feature = "mlx")]
     {
@@ -70,8 +72,8 @@ fn main() -> Result<()> {
     let chunk_size = (chunk_sec * SAMPLE_RATE as f64) as usize;
     let num_chunks = (total_samples + chunk_size - 1) / chunk_size;
     eprintln!(
-        "[test] Chunk size: {} samples ({:.1}s), {} chunks",
-        chunk_size, chunk_sec, num_chunks
+        "[test] Chunk size: {} samples ({:.1}s), {} chunks, rollback={}",
+        chunk_size, chunk_sec, num_chunks, rollback
     );
 
     // -----------------------------------------------------------------------
@@ -140,7 +142,7 @@ fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     eprintln!("\n[test] === Step 3: Streaming (incremental KV cache) ===");
     let t0 = Instant::now();
-    let mut stream_state = model.init_streaming(None)?;
+    let mut stream_state = model.init_streaming(None, rollback)?;
     let mut last_incremental_text = String::new();
     let mut accumulated: Vec<f32> = Vec::new();
 

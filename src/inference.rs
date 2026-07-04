@@ -346,6 +346,15 @@ pub struct StreamingState {
     /// Conv2d batch-size-dependent numerical differences that would
     /// invalidate the cached KV.
     cached_audio_embeds: Option<Tensor>,
+    /// Number of mel frames already encoded (for incremental encoding).
+    cached_mel_frames: usize,
+    /// Token IDs generated in the previous call (for prefix rollback).
+    last_generated_ids: Vec<i64>,
+    /// Number of trailing tokens to re-decode each call. The preceding
+    /// tokens are kept as a prefix prompt (re-prefilled, not re-decoded).
+    /// 0 = re-decode all tokens every call (default, exact match).
+    /// N = only re-decode the last N tokens, prefix the rest.
+    rollback_tokens: usize,
     /// Device for tensor creation.
     device: Device,
 }
@@ -353,7 +362,17 @@ pub struct StreamingState {
 impl AsrInference {
     /// Initialize streaming state. Call once before the first
     /// `streaming_transcribe` call.
-    pub fn init_streaming(&self, language: Option<&str>) -> Result<StreamingState> {
+    ///
+    /// `rollback_tokens`: number of trailing generated tokens to re-decode
+    /// each call. 0 = re-decode all (exact match with offline). N = keep
+    /// earlier tokens as prefix, only re-decode last N. This speeds up
+    /// streaming at the cost of potentially slightly different output at
+    /// the rollback boundary.
+    pub fn init_streaming(
+        &self,
+        language: Option<&str>,
+        rollback_tokens: usize,
+    ) -> Result<StreamingState> {
         let _ = language; // forced language not yet supported in streaming
         let text_config = &self.config.thinker_config.text_config;
 
@@ -387,6 +406,9 @@ impl AsrInference {
             sin,
             pre_audio_embeds,
             cached_audio_embeds: None,
+            cached_mel_frames: 0,
+            last_generated_ids: Vec::new(),
+            rollback_tokens,
             device: self.device,
         })
     }
@@ -394,61 +416,76 @@ impl AsrInference {
     /// Incremental streaming transcription.
     ///
     /// On the first call, does a full prefill. On subsequent calls, reuses
-    /// the KV cache and only prefills the new audio tokens + post-audio tokens.
-    /// Returns the transcription result.
+    /// the KV cache and only prefills the new audio tokens + post-audio
+    /// tokens + optional prefix text. Returns the transcription result.
     pub fn streaming_transcribe(
         &self,
         samples: &[f32],
         state: &mut StreamingState,
     ) -> Result<TranscribeResult> {
         let duration_seconds = samples.len() as f64 / MEL_SAMPLE_RATE as f64;
+        let chunk_size = self.audio_encoder.chunk_size();
 
-        // Step 1: Compute mel + encode audio
+        // Step 1: Compute mel
         let mel = self.mel_extractor.extract(samples, self.device)?;
-        let audio_embeds = self.audio_encoder.forward(&mel);
-        audio_embeds.eval();
-        let num_audio_tokens = audio_embeds.size()[0] as usize;
+        let total_mel_frames = mel.size()[1] as usize;
+        let has_tail = total_mel_frames % chunk_size != 0;
 
-        // DIAGNOSTIC: compare current audio_embeds[:old_audio] with the
-        // embeds that were used to build the cached KV. We approximate by
-        // checking if the encoder produces stable outputs for the first
-        // old_audio tokens when given different total audio lengths.
-        if std::env::var("ASR_VERIFY_ENCODER").as_deref() == Ok("1") && state.kv_cache.is_some() {
-            let old_audio = state.audio_tokens_in_cache;
-            if old_audio > 0 && old_audio < num_audio_tokens {
-                // Compare first old_audio embeds between current encoder output
-                // and a re-encode of just the first old_audio tokens worth of
-                // mel frames. We need to figure out how many mel frames
-                // produced old_audio tokens. Each full chunk (100 frames)
-                // produces 13 tokens.
-                let chunk_size = self.audio_encoder.chunk_size();
+        // Step 2: Incremental encoding — only encode new mel frames.
+        //
+        // When ASR_FORCE_CHUNK_LOCAL=1, each chunk is encoded independently,
+        // so we can safely encode only the new frames and concatenate.
+        // We cache embeddings up to the last complete chunk boundary; the
+        // tail (if any) is re-encoded each call.
+        let force_chunk_local = std::env::var("ASR_FORCE_CHUNK_LOCAL").as_deref() == Ok("1");
+
+        let audio_embeds = if force_chunk_local
+            && state.cached_mel_frames > 0
+            && state.cached_mel_frames < total_mel_frames
+        {
+            // New frames start from the last cached boundary.
+            let new_frame_start = state.cached_mel_frames;
+            let new_frame_count = total_mel_frames - new_frame_start;
+            let new_mel = mel.narrow(1, new_frame_start as i64, new_frame_count as i64);
+            let new_embeds = self.audio_encoder.forward(&new_mel);
+            new_embeds.eval();
+
+            let cached = state.cached_audio_embeds.as_ref().unwrap();
+            let combined = Tensor::cat(&[cached.shallow_clone(), new_embeds], 0);
+            combined.eval();
+
+            // Update cache: store up to the last complete chunk boundary.
+            let full_frames = (total_mel_frames / chunk_size) * chunk_size;
+            if has_tail {
+                // Only cache the full-chunk portion.
                 let tokens_per_chunk = self.audio_encoder.tokens_per_chunk();
-                let full_chunks_needed = (old_audio + tokens_per_chunk - 1) / tokens_per_chunk;
-                let mel_frames_needed = full_chunks_needed * chunk_size;
-                let mel_frames_needed = mel_frames_needed.min(mel.size()[1] as usize);
-                let short_mel = mel.narrow(1, 0, mel_frames_needed as i64);
-                let short_embeds = self.audio_encoder.forward(&short_mel);
-                short_embeds.eval();
-
-                // Also re-encode the full mel again to check determinism.
-                let full_embeds2 = self.audio_encoder.forward(&mel);
-                full_embeds2.eval();
-
-                // Compare first old_audio tokens
-                let cur_seg = audio_embeds.narrow(0, 0, old_audio as i64);
-                let short_seg = short_embeds.narrow(0, 0, old_audio as i64);
-                let full2_seg = full_embeds2.narrow(0, 0, old_audio as i64);
-                let emb_diff = (&cur_seg - &short_seg).abs().max().f64_value(&[]);
-                let det_diff = (&cur_seg - &full2_seg).abs().max().f64_value(&[]);
-                tracing::warn!(
-                    "[verify-encoder] old_audio={} mel_frames_needed={} embed_diff={:.3e} determinism_diff={:.3e}",
-                    old_audio,
-                    mel_frames_needed,
-                    emb_diff,
-                    det_diff
-                );
+                let full_chunks = full_frames / chunk_size;
+                let full_tokens = full_chunks * tokens_per_chunk;
+                state.cached_audio_embeds = Some(combined.narrow(0, 0, full_tokens as i64));
+                state.cached_mel_frames = full_frames;
+            } else {
+                state.cached_audio_embeds = Some(combined.shallow_clone());
+                state.cached_mel_frames = total_mel_frames;
             }
-        }
+            combined
+        } else {
+            // First call or fallback: full encode.
+            let embeds = self.audio_encoder.forward(&mel);
+            embeds.eval();
+            let full_frames = (total_mel_frames / chunk_size) * chunk_size;
+            if has_tail {
+                let tokens_per_chunk = self.audio_encoder.tokens_per_chunk();
+                let full_chunks = full_frames / chunk_size;
+                let full_tokens = full_chunks * tokens_per_chunk;
+                state.cached_audio_embeds = Some(embeds.narrow(0, 0, full_tokens as i64));
+                state.cached_mel_frames = full_frames;
+            } else {
+                state.cached_audio_embeds = Some(embeds.shallow_clone());
+                state.cached_mel_frames = total_mel_frames;
+            }
+            embeds
+        };
+        let num_audio_tokens = audio_embeds.size()[0] as usize;
 
         tracing::info!(
             "[streaming] audio_tokens={} (was_cached={}) delta={}",
@@ -457,32 +494,9 @@ impl AsrInference {
             num_audio_tokens as i64 - state.audio_tokens_in_cache as i64
         );
 
-        // Build stable audio embeddings: reuse cached embeddings for
-        // previously-seen tokens to avoid Conv2d batch-size-dependent
-        // numerical differences (~1e-7) that get amplified through 28
-        // decoder layers and invalidate the cached KV.
-        let audio_embeds = if let Some(ref cached) = state.cached_audio_embeds {
-            let old_audio = state.audio_tokens_in_cache;
-            if old_audio > 0 && old_audio < num_audio_tokens {
-                // Concat: cached[:old_audio] + new[old_audio..]
-                let old_part = cached.narrow(0, 0, old_audio as i64);
-                let new_part =
-                    audio_embeds.narrow(0, old_audio as i64, (num_audio_tokens - old_audio) as i64);
-                let stable = Tensor::cat(&[old_part, new_part], 0);
-                stable.eval();
-                stable
-            } else {
-                audio_embeds
-            }
-        } else {
-            audio_embeds
-        };
-        // Cache current embeddings for next call.
-        state.cached_audio_embeds = Some(audio_embeds.shallow_clone());
-
         let text_config = &self.config.thinker_config.text_config;
 
-        // Step 2: Prefill — get logits at the last position
+        // Step 3: Prefill
         let logits = if state.kv_cache.is_none() {
             // First call: full prefill
             self.streaming_full_prefill(&audio_embeds, num_audio_tokens, state, text_config)?
@@ -497,24 +511,10 @@ impl AsrInference {
                 text_config,
             );
             state.kv_cache = Some(kv_cache);
-            let inc_logits = result?;
-
-            // DIAGNOSTIC: compare incremental logits vs fresh full-prefill logits.
-            // Enabled via ASR_VERIFY_INCREMENTAL=1. Does NOT modify state.
-            if std::env::var("ASR_VERIFY_INCREMENTAL").as_deref() == Ok("1") {
-                self.verify_incremental_vs_fresh(
-                    &audio_embeds,
-                    num_audio_tokens,
-                    state,
-                    text_config,
-                    &inc_logits,
-                );
-            }
-
-            inc_logits
+            result?
         };
 
-        // Step 3: Autoregressive decode
+        // Step 4: Autoregressive decode
         let kv_cache = state.kv_cache.as_mut().unwrap();
         let seq_len = state.cache_seq_len;
         let max_new_tokens: usize = 256;
@@ -524,7 +524,20 @@ impl AsrInference {
         let logits_seq_len = logits.size()[1];
         let mut next_logits = logits.narrow(1, logits_seq_len - 1, 1).squeeze_dim(1);
         let mut current_pos = seq_len;
-        let mut generated_ids: Vec<i64> = Vec::new();
+
+        // When rollback_tokens > 0, the prefix text was already prefilled in
+        // streaming_incremental_prefill. We start with those prefix IDs and
+        // only decode new tokens.
+        let prefix_len = state
+            .last_generated_ids
+            .len()
+            .saturating_sub(state.rollback_tokens);
+        let prefix_ids: Vec<i64> = if state.rollback_tokens > 0 && prefix_len > 0 {
+            state.last_generated_ids[..prefix_len].to_vec()
+        } else {
+            Vec::new()
+        };
+        let mut generated_ids = prefix_ids.clone();
 
         for _ in 0..max_new_tokens {
             let next_token = next_logits.argmax(-1, false).int64_value(&[0]);
@@ -546,13 +559,15 @@ impl AsrInference {
             current_pos += 1;
         }
 
-        tracing::info!("Streaming: generated {} tokens", generated_ids.len());
+        tracing::info!(
+            "Streaming: generated {} tokens (prefix={}, new={})",
+            generated_ids.len(),
+            prefix_ids.len(),
+            generated_ids.len() - prefix_ids.len()
+        );
 
-        // DIAGNOSTIC: after decode, compare KV cache against fresh prefill.
-        // This shows whether decode corrupts earlier K cache positions.
-        if std::env::var("ASR_VERIFY_POST_DECODE").as_deref() == Ok("1") {
-            self.verify_post_decode(&audio_embeds, num_audio_tokens, state, text_config);
-        }
+        // Save generated IDs for next call's prefix rollback.
+        state.last_generated_ids = generated_ids.clone();
 
         // Cleanup
         #[cfg(feature = "mlx")]
@@ -674,22 +689,37 @@ impl AsrInference {
             );
         }
 
-        // Step 2+3: Prefill new audio tokens + post-audio tokens in a
-        // single forward call. This avoids potential numerical differences
-        // from splitting the prefill into two calls.
+        // Step 2+3: Prefill new audio tokens + post-audio tokens + prefix
+        // text in a single forward call. This avoids potential numerical
+        // differences from splitting the prefill into multiple calls.
         let num_new = num_audio_tokens - old_audio;
         let pos_start = (PRE_AUDIO_TOKEN_COUNT + old_audio) as i64;
-        let total_new = num_new + POST_AUDIO_TOKENS.len();
+
+        // Compute prefix text IDs (rollback strategy).
+        let prefix_ids: Vec<i64> = if state.rollback_tokens > 0 {
+            let last = &state.last_generated_ids;
+            let prefix_len = last.len().saturating_sub(state.rollback_tokens);
+            if prefix_len > 0 {
+                last[..prefix_len].to_vec()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let total_new = num_new + POST_AUDIO_TOKENS.len() + prefix_ids.len();
 
         tracing::debug!(
-            "[streaming-inc] truncate_len={} num_new={} pos_start={} total_new={}",
+            "[streaming-inc] truncate_len={} num_new={} pos_start={} total_new={} prefix={}",
             truncate_len,
             num_new,
             pos_start,
-            total_new
+            total_new,
+            prefix_ids.len()
         );
 
-        // Build hidden states: new audio embeds + post-audio embeds
+        // Build hidden states: new audio embeds + post-audio embeds + prefix text embeds
         let mut parts: Vec<Tensor> = Vec::with_capacity(total_new);
         for i in old_audio..num_audio_tokens {
             parts.push(audio_embeds.get(i as i64).unsqueeze(0).unsqueeze(0));
@@ -697,6 +727,11 @@ impl AsrInference {
         let post_tensor = Tensor::from_slice_i64(POST_AUDIO_TOKENS).to_device(state.device);
         let post_embeds = self.text_decoder.embed(&post_tensor).unsqueeze(0);
         parts.push(post_embeds);
+        if !prefix_ids.is_empty() {
+            let prefix_tensor = Tensor::from_slice_i64(&prefix_ids).to_device(state.device);
+            let prefix_embeds = self.text_decoder.embed(&prefix_tensor).unsqueeze(0);
+            parts.push(prefix_embeds);
+        }
         let new_hidden = Tensor::cat(&parts, 1); // (1, total_new, dim)
 
         let cos = state.cos.narrow(0, pos_start, total_new as i64);
