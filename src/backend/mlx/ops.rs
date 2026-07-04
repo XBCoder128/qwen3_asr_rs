@@ -556,7 +556,8 @@ pub fn fast_sdpa(
 
 pub fn rfft(a: &MlxArray, n: i32, axis: i32) -> MlxArray {
     let mut res = MlxArray::empty();
-    unsafe { ffi::mlx_fft_rfft(&mut res.ptr, a.ptr, n, axis, default_stream()) };
+    // MLX_FFT_NORM_BACKWARD = 0 (no normalization, matches torch.stft default)
+    unsafe { ffi::mlx_fft_rfft(&mut res.ptr, a.ptr, n, axis, 0, default_stream()) };
     res
 }
 

@@ -524,11 +524,13 @@ extern "C" {
     // FFT
     // -----------------------------------------------------------------------
 
+    // mlx_fft_norm: BACKWARD=0, ORTHO=1, FORWARD=2
     pub fn mlx_fft_rfft(
         res: *mut mlx_array,
         a: mlx_array,
         n: c_int,
         axis: c_int,
+        norm: c_int,
         s: mlx_stream,
     ) -> c_int;
 
