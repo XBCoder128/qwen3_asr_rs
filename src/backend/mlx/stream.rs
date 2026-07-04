@@ -56,3 +56,24 @@ pub fn synchronize() {
     let stream = default_stream();
     unsafe { ffi::mlx_synchronize(stream) };
 }
+
+/// Clear the MLX memory cache. MLX retains allocated Metal buffers for reuse,
+/// but they are never returned to the OS. Call this after inference to free
+/// GPU memory — critical for streaming where inference runs repeatedly.
+pub fn clear_cache() {
+    unsafe { ffi::mlx_clear_cache() };
+}
+
+/// Get current active memory usage in bytes.
+pub fn active_memory() -> usize {
+    let mut val: usize = 0;
+    unsafe { ffi::mlx_get_active_memory(&mut val) };
+    val
+}
+
+/// Get cache memory usage in bytes.
+pub fn cache_memory() -> usize {
+    let mut val: usize = 0;
+    unsafe { ffi::mlx_get_cache_memory(&mut val) };
+    val
+}

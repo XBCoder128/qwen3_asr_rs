@@ -1,6 +1,6 @@
+use crate::tensor::{Device, Tensor};
 use anyhow::{Context, Result};
 use std::path::Path;
-use crate::tensor::{Device, Tensor};
 
 use crate::audio;
 use crate::audio_encoder::AudioEncoder;
@@ -8,9 +8,7 @@ use crate::config::AsrConfig;
 use crate::layers::compute_mrope_cos_sin;
 use crate::mel::WhisperFeatureExtractor;
 use crate::text_decoder::{create_causal_mask, KvCache, TextDecoder};
-use crate::tokenizer::{
-    AsrTokenizer, AUDIO_PAD_TOKEN_ID, ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID,
-};
+use crate::tokenizer::{AsrTokenizer, AUDIO_PAD_TOKEN_ID, ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID};
 use crate::weights;
 
 const MEL_SAMPLE_RATE: u32 = 16000;
@@ -31,8 +29,8 @@ impl AsrInference {
         tracing::info!("Loading model from {:?}", model_dir);
 
         // Load config
-        let config =
-            AsrConfig::from_file(&model_dir.join("config.json")).context("Failed to load config")?;
+        let config = AsrConfig::from_file(&model_dir.join("config.json"))
+            .context("Failed to load config")?;
 
         // Load weights (supports both single-file and sharded safetensors)
         let all_weights =
@@ -61,13 +59,12 @@ impl AsrInference {
 
         // Load tokenizer
         tracing::info!("Loading tokenizer...");
-        let tokenizer =
-            AsrTokenizer::from_dir(model_dir).context("Failed to load tokenizer")?;
+        let tokenizer = AsrTokenizer::from_dir(model_dir).context("Failed to load tokenizer")?;
 
         // Create mel feature extractor
         let mel_extractor = WhisperFeatureExtractor::new(
-            400,  // n_fft
-            160,  // hop_length
+            400, // n_fft
+            160, // hop_length
             config.thinker_config.audio_config.num_mel_bins,
             MEL_SAMPLE_RATE,
             device,
@@ -90,10 +87,19 @@ impl AsrInference {
         // Step 1: Load and preprocess audio
         tracing::info!("Loading audio from {}", audio_path);
         let samples = audio::load_audio(audio_path, MEL_SAMPLE_RATE)?;
+        self.transcribe_samples(&samples, language)
+    }
+
+    /// Transcribe raw 16kHz mono f32 samples directly (no file I/O).
+    pub fn transcribe_samples(
+        &self,
+        samples: &[f32],
+        language: Option<&str>,
+    ) -> Result<TranscribeResult> {
         let duration_seconds = samples.len() as f64 / MEL_SAMPLE_RATE as f64;
 
         // Step 2: Compute mel spectrogram
-        let mel = self.mel_extractor.extract(&samples, self.device)?;
+        let mel = self.mel_extractor.extract(samples, self.device)?;
         let num_mel_frames = mel.size()[1] as usize;
         tracing::info!("Mel spectrogram: {} frames", num_mel_frames);
 
@@ -104,16 +110,18 @@ impl AsrInference {
         tracing::info!("Audio encoder: {} tokens", num_audio_tokens);
 
         // Step 4: Build input token sequence
-        let (input_ids, audio_positions) =
-            self.build_prompt(num_audio_tokens, language)?;
+        let (input_ids, audio_positions) = self.build_prompt(num_audio_tokens, language)?;
         let seq_len = input_ids.len();
 
         // Step 5: Build embeddings with audio injection
-        let input_tensor =
-            Tensor::from_slice_i64(&input_ids).to_device(self.device);
+        let input_tensor = Tensor::from_slice_i64(&input_ids).to_device(self.device);
         let mut hidden_states = self.text_decoder.embed(&input_tensor).unsqueeze(0);
 
-        // Replace audio_pad positions with audio encoder embeddings
+        // Replace audio_pad positions with audio encoder embeddings.
+        // For long audio, this loop creates a deep computation graph in MLX's
+        // lazy eval. We eval() periodically to break the chain and free
+        // intermediate tensors — otherwise memory grows linearly with the
+        // number of audio tokens.
         for (embed_idx, &seq_pos) in audio_positions.iter().enumerate() {
             let audio_embed = audio_embeds.get(embed_idx as i64);
             hidden_states = hidden_states.slice_scatter(
@@ -123,19 +131,21 @@ impl AsrInference {
                 seq_pos as i64 + 1,
                 1,
             );
+            // Materialize every 32 tokens to break the computation graph.
+            if embed_idx % 32 == 31 {
+                hidden_states.eval();
+            }
         }
+        hidden_states.eval(); // Final materialize
 
         // Step 6: Precompute MRoPE cos/sin for all positions (prefill + max decode)
         let text_config = &self.config.thinker_config.text_config;
-        let max_new_tokens: usize = 4096;
-        // Precompute enough positions for prefill + a generous decode budget
-        let max_total_positions = seq_len + 512;
+        let max_new_tokens: usize = 256; // ASR rarely exceeds 256 tokens
+                                         // Precompute enough positions for prefill + decode budget
+        let max_total_positions = seq_len + max_new_tokens + 8;
         let all_positions: Vec<i64> = (0..max_total_positions as i64).collect();
-        let all_pos_ids: [Vec<i64>; 3] = [
-            all_positions.clone(),
-            all_positions.clone(),
-            all_positions,
-        ];
+        let all_pos_ids: [Vec<i64>; 3] =
+            [all_positions.clone(), all_positions.clone(), all_positions];
         let (all_cos, all_sin) = compute_mrope_cos_sin(
             &all_pos_ids,
             text_config.head_dim,
@@ -153,13 +163,9 @@ impl AsrInference {
         let mask = create_causal_mask(seq_len as i64, 0, self.device);
         let mut kv_cache = KvCache::new(text_config.num_hidden_layers);
 
-        let logits = self.text_decoder.forward(
-            &hidden_states,
-            &cos,
-            &sin,
-            &mut kv_cache,
-            Some(&mask),
-        );
+        let logits =
+            self.text_decoder
+                .forward(&hidden_states, &cos, &sin, &mut kv_cache, Some(&mask));
         // Eval prefill output to materialize computation graph before decode loop
         logits.eval();
 
@@ -188,20 +194,41 @@ impl AsrInference {
             let new_sin = all_sin.narrow(0, current_pos as i64, 1);
 
             // Single-token decode: causal mask is all-zeros (no masking needed)
-            next_logits = self.text_decoder.forward(
-                &next_hidden,
-                &new_cos,
-                &new_sin,
-                &mut kv_cache,
-                None,
-            );
+            next_logits =
+                self.text_decoder
+                    .forward(&next_hidden, &new_cos, &new_sin, &mut kv_cache, None);
             next_logits = next_logits.squeeze_dim(1);
+            // Materialize to prevent the decode loop from building a deep graph.
+            next_logits.eval();
 
             current_pos += 1;
         }
 
         // Step 9: Parse output
         tracing::info!("Generated {} tokens", generated_ids.len());
+
+        // Explicitly drop large intermediates before synchronize.
+        drop(kv_cache);
+        drop(all_cos);
+        drop(all_sin);
+        drop(hidden_states);
+        drop(audio_embeds);
+        drop(mel);
+
+        // Flush the entire MLX computation graph so all intermediate tensors
+        // are freed before we return. Critical for streaming where this
+        // function is called repeatedly.
+        #[cfg(feature = "mlx")]
+        {
+            crate::backend::mlx::stream::synchronize();
+            crate::backend::mlx::stream::clear_cache();
+            eprintln!(
+                "[mlx] memory after clear: active={}MB cache={}MB",
+                crate::backend::mlx::stream::active_memory() / 1_000_000,
+                crate::backend::mlx::stream::cache_memory() / 1_000_000,
+            );
+        }
+
         let raw_text = self.tokenizer.decode(&generated_ids)?;
         tracing::debug!("Raw output: {:?}", raw_text);
         let (language_detected, transcription) = parse_asr_output(&raw_text, language.is_some());
@@ -247,17 +274,16 @@ impl AsrInference {
 
         if let Some(lang) = language {
             tokens.push(77091); // assistant
-            tokens.push(198);   // \n
+            tokens.push(198); // \n
             let prefix = format!("language {}", capitalize_first(lang));
             tokens.extend(self.tokenizer.encode(&prefix)?);
         } else {
             tokens.push(77091); // assistant
-            tokens.push(198);   // \n
+            tokens.push(198); // \n
         }
 
         Ok((tokens, audio_positions))
     }
-
 }
 
 /// Result of ASR transcription.
