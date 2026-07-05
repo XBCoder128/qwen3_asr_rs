@@ -357,6 +357,17 @@ pub struct StreamingState {
     /// 0 = re-decode all tokens every call (default, exact match).
     /// N = only re-decode the last N tokens, prefix the rest.
     rollback_tokens: usize,
+    /// Decode-call counter (increments once per processed streaming call).
+    chunk_id: usize,
+    /// For the first N processed calls, do NOT use the previous output as
+    /// prefix (matches official `unfixed_chunk_num`, default 2). Early
+    /// hypotheses on very little audio are unreliable; freezing them as a
+    /// prefix locks in errors and triggers hallucinated continuations.
+    pub unfixed_chunk_num: usize,
+    /// Max NEW tokens decoded per streaming call (beyond the prefix).
+    /// Official streaming examples use a small budget (32) — a large budget
+    /// lets a derailed decode hallucinate long passages of unrelated text.
+    pub max_new_tokens: usize,
     /// Forced language (e.g. "english", "chinese"). None = auto-detect.
     forced_language: Option<String>,
     /// Token IDs for the language prefix (e.g. "language English").
@@ -437,6 +448,9 @@ impl AsrInference {
             mel_cache: crate::mel::MelCache::default(),
             last_generated_ids: Vec::new(),
             rollback_tokens,
+            chunk_id: 0,
+            unfixed_chunk_num: 2,
+            max_new_tokens: 32,
             forced_language,
             language_prefix_ids,
             device: self.device,
@@ -584,10 +598,13 @@ impl AsrInference {
         // Rollback prefix must be computed before the mutable KV borrow below.
         let prefix_ids = self.streaming_rollback_prefix_ids(state)?;
 
-        // Step 4: Autoregressive decode
+        // Step 4: Autoregressive decode. The per-call budget only covers the
+        // NEW tokens for this call's fresh audio (the prefix is prefilled),
+        // so a small budget is enough — and it caps how far a derailed
+        // decode can hallucinate.
         let kv_cache = state.kv_cache.as_mut().unwrap();
         let seq_len = state.cache_seq_len;
-        let max_new_tokens: usize = 256;
+        let max_new_tokens: usize = state.max_new_tokens.max(state.rollback_tokens + 8);
         let eos_token_ids = vec![ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID];
 
         // logits has shape (1, num_prefilled, vocab_size). We need the last one.
@@ -641,11 +658,12 @@ impl AsrInference {
             "Streaming: generated {} tokens (prefix={}, new={})",
             generated_ids.len(),
             prefix_ids.len(),
-            generated_ids.len() - prefix_ids.len()
+            generated_ids.len().saturating_sub(prefix_ids.len())
         );
 
         // Save generated IDs for next call's prefix rollback.
         state.last_generated_ids = generated_ids.clone();
+        state.chunk_id += 1;
 
         let t_total = t_start.elapsed();
         tracing::info!(
@@ -1281,6 +1299,12 @@ impl AsrInference {
         if state.rollback_tokens == 0 || state.last_generated_ids.is_empty() {
             return Ok(Vec::new());
         }
+        // Official `unfixed_chunk_num` behavior: hypotheses from the first
+        // few calls are based on very little audio and are unreliable —
+        // freezing them as a prefix locks in errors permanently.
+        if state.chunk_id < state.unfixed_chunk_num {
+            return Ok(Vec::new());
+        }
 
         let raw = self.tokenizer.decode(&state.last_generated_ids)?;
         let cur_ids = self.tokenizer.encode(&raw)?;
@@ -1371,16 +1395,21 @@ fn sanitize_for_rollback(ids: &mut Vec<i64>) {
     }
 }
 
-/// Detect and trim a long repeated subsequence at the end of `ids`.
+/// Detect and trim long repeated subsequences at the end of `ids`.
 ///
 /// If the last `len` tokens (len >= MIN_REPEAT) appear earlier in the
-/// sequence (non-overlapping), truncate the repeated tail. This catches
-/// the common case where the decoder copies a large chunk of the prefix.
+/// sequence (non-overlapping), truncate the repeated tail. Loops until no
+/// repeat remains, so a sentence hallucinated 3+ times in a row is reduced
+/// to a single occurrence (one copy trimmed per pass).
 fn trim_repeated_tail(ids: &mut Vec<i64>) {
+    while trim_repeated_tail_once(ids) {}
+}
+
+fn trim_repeated_tail_once(ids: &mut Vec<i64>) -> bool {
     const MIN_REPEAT: usize = 6;
     let n = ids.len();
     if n < MIN_REPEAT * 2 {
-        return;
+        return false;
     }
     // Try from longest possible repeat down to MIN_REPEAT.
     for len in (MIN_REPEAT..=n / 2).rev() {
@@ -1394,10 +1423,11 @@ fn trim_repeated_tail(ids: &mut Vec<i64>) {
                     len,
                     start
                 );
-                return;
+                return true;
             }
         }
     }
+    false
 }
 
 fn parse_asr_output(raw: &str, language_forced: bool) -> (String, String) {

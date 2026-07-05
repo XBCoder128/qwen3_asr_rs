@@ -220,14 +220,32 @@ the internal buffers: that would defeat buffer donation and force copies.
   are STFT'd per call; the global log-mel normalization is re-applied to the
   full cached spectrogram (cheap). STFT itself is batched: one gather +
   one batched rFFT instead of per-frame slice/rfft graph nodes.
-- **Pipelined decode loop**: argmax token stays on-device and feeds the next
-  forward directly; `Tensor::async_eval` queues step i+1 before the CPU
-  reads token i for the EOS check.
+- **Decode loop reads the token on CPU before embedding it** (do NOT feed
+  the GPU argmax tensor straight into `embed`/take under lazy eval — it can
+  read stale rows and lock decoding onto one token).
 - **No per-call `clear_cache()`**: MLX buffer cache is only cleared when it
   exceeds 3 GB. Clearing every call forced Metal buffer re-allocation and
   was a large per-call cost.
 - Prefill builds hidden states via `cat([pre, audio, post, ...])` (audio
   positions are contiguous) — no per-token `slice_scatter`/`get` loops.
+
+### Streaming anti-hallucination guards (applied)
+The rollback prefix is the #1 source of stuck/hallucinated output — errors
+frozen into the prefix condition all future decoding:
+- **Prefix via decode→re-encode** (`streaming_rollback_prefix_ids`), never
+  raw token-ID slicing: hard-slicing breaks BPE boundaries on multilingual
+  text (U+FFFD in prefix poisons the KV cache → decoder locks onto one
+  token like `!` regardless of audio).
+- **`unfixed_chunk_num` (default 2)**: no prefix for the first N calls —
+  hypotheses from <2 chunks of audio are unreliable and must not be frozen.
+- **`max_new_tokens` per streaming call (default 32)**: caps how far a
+  derailed decode can hallucinate (official streaming examples use 32).
+- **Runaway repeat guards**: short-cycle detection stops decode early
+  (period ≤4, threshold 6 in streaming), `trim_repeated_tail` loops until
+  no whole-phrase repeat remains, and `sanitize_for_rollback` cleans the
+  IDs before they become the next call's prefix.
+- Small `rollback_tokens` values (1–2) freeze errors quickly and cause
+  visible wording drift vs offline; prefer 3–7.
 
 ## Future Optimization Opportunities
 
