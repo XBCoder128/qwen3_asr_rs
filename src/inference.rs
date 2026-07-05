@@ -172,10 +172,21 @@ impl AsrInference {
         let mut current_pos = seq_len;
 
         let mut token_arr = first_logits.argmax(-1, false);
-        Tensor::async_eval(&[&token_arr]);
+        token_arr.eval();
 
         for _ in 0..max_new_tokens {
-            let next_hidden = self.text_decoder.embed(&token_arr).unsqueeze(0);
+            let token = token_arr.int64_value(&[0]);
+            if eos_token_ids.contains(&token) {
+                break;
+            }
+            generated_ids.push(token);
+            if let Some(period) = detect_streaming_runaway(&generated_ids) {
+                collapse_tail_repetition(&mut generated_ids, period);
+                break;
+            }
+
+            let next_input = Tensor::from_slice_i64(&[token]).to_device(self.device);
+            let next_hidden = self.text_decoder.embed(&next_input).unsqueeze(0);
 
             // Index into precomputed cos/sin for this position
             let new_cos = all_cos.narrow(0, current_pos as i64, 1);
@@ -186,15 +197,9 @@ impl AsrInference {
                 .text_decoder
                 .forward(&next_hidden, &new_cos, &new_sin, &mut kv_cache, None)
                 .squeeze_dim(1);
-            let next_token_arr = next_logits.argmax(-1, false);
-            Tensor::async_eval(&[&next_token_arr]);
+            token_arr = next_logits.argmax(-1, false);
+            token_arr.eval();
 
-            let token = token_arr.int64_value(&[0]);
-            if eos_token_ids.contains(&token) {
-                break;
-            }
-            generated_ids.push(token);
-            token_arr = next_token_arr;
             current_pos += 1;
         }
 
@@ -576,6 +581,9 @@ impl AsrInference {
         };
         let t_prefill = t_prefill_start.elapsed();
 
+        // Rollback prefix must be computed before the mutable KV borrow below.
+        let prefix_ids = self.streaming_rollback_prefix_ids(state)?;
+
         // Step 4: Autoregressive decode
         let kv_cache = state.kv_cache.as_mut().unwrap();
         let seq_len = state.cache_seq_len;
@@ -587,51 +595,47 @@ impl AsrInference {
         let first_logits = logits.narrow(1, logits_seq_len - 1, 1).squeeze_dim(1);
         let mut current_pos = seq_len;
 
-        // When rollback_tokens > 0, the prefix text was already prefilled in
-        // streaming_incremental_prefill. We start with those prefix IDs and
-        // only decode new tokens.
-        let prefix_len = state
-            .last_generated_ids
-            .len()
-            .saturating_sub(state.rollback_tokens);
-        let prefix_ids: Vec<i64> = if state.rollback_tokens > 0 && prefix_len > 0 {
-            state.last_generated_ids[..prefix_len].to_vec()
-        } else {
-            Vec::new()
-        };
         let mut generated_ids = prefix_ids.clone();
 
-        // Pipelined greedy decode: keep the argmax token on-device and feed
-        // it straight into the next forward pass, queue that step with
-        // async_eval, and only then read back the *current* token. The GPU
-        // computes step i+1 while the CPU checks step i for EOS.
         let mut token_arr = first_logits.argmax(-1, false);
-        Tensor::async_eval(&[&token_arr]);
+        token_arr.eval();
 
         for _ in 0..max_new_tokens {
-            let next_hidden = self.text_decoder.embed(&token_arr).unsqueeze(0);
-            let new_cos = state.cos.narrow(0, current_pos, 1);
-            let new_sin = state.sin.narrow(0, current_pos, 1);
-            let next_logits = self
-                .text_decoder
-                .forward(&next_hidden, &new_cos, &new_sin, kv_cache, None)
-                .squeeze_dim(1);
-            let next_token_arr = next_logits.argmax(-1, false);
-            Tensor::async_eval(&[&next_token_arr]);
-
             let token = token_arr.int64_value(&[0]);
             if eos_token_ids.contains(&token) {
                 break;
             }
             generated_ids.push(token);
-            token_arr = next_token_arr;
+            if let Some(period) = detect_streaming_runaway(&generated_ids) {
+                collapse_tail_repetition(&mut generated_ids, period);
+                tracing::warn!(
+                    "[streaming] runaway decode stopped (period={}) — KV prefix will not carry repeats",
+                    period
+                );
+                break;
+            }
+
+            // Embed from a fresh CPU int64 scalar — feeding the GPU argmax
+            // tensor directly into take() can produce stale/wrong rows under
+            // lazy eval, which manifests as a single token (e.g. '!') stuck
+            // regardless of subsequent audio.
+            let next_input = Tensor::from_slice_i64(&[token]).to_device(state.device);
+            let next_hidden = self.text_decoder.embed(&next_input).unsqueeze(0);
+            let new_cos = state.cos.narrow(0, current_pos, 1);
+            let new_sin = state.sin.narrow(0, current_pos, 1);
+
+            let next_logits = self
+                .text_decoder
+                .forward(&next_hidden, &new_cos, &new_sin, kv_cache, None)
+                .squeeze_dim(1);
+            token_arr = next_logits.argmax(-1, false);
+            token_arr.eval();
             current_pos += 1;
         }
 
-        // Post-decode: detect and trim long repeated subsequences.
-        // When rollback > 0, the decoder may copy chunks of the prefix.
-        // This catches and removes such repetitions.
+        // Post-decode cleanup before the result feeds the next rollback prefix.
         trim_repeated_tail(&mut generated_ids);
+        sanitize_for_rollback(&mut generated_ids);
 
         tracing::info!(
             "Streaming: generated {} tokens (prefix={}, new={})",
@@ -788,18 +792,8 @@ impl AsrInference {
         let num_new = num_audio_tokens - old_audio;
         let pos_start = (PRE_AUDIO_TOKEN_COUNT + old_audio) as i64;
 
-        // Compute prefix text IDs (rollback strategy).
-        let prefix_ids: Vec<i64> = if state.rollback_tokens > 0 {
-            let last = &state.last_generated_ids;
-            let prefix_len = last.len().saturating_sub(state.rollback_tokens);
-            if prefix_len > 0 {
-                last[..prefix_len].to_vec()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
+        // Compute prefix via decode→re-encode (UTF-8 safe), NOT raw token slice.
+        let prefix_ids = self.streaming_rollback_prefix_ids(state)?;
 
         let total_new =
             num_new + POST_AUDIO_TOKENS.len() + state.language_prefix_ids.len() + prefix_ids.len();
@@ -1245,13 +1239,7 @@ impl AsrInference {
             hidden_parts.push(lang_embeds);
         }
 
-        let prefix_ids: Vec<i64> = if state.rollback_tokens > 0 {
-            let last = &state.last_generated_ids;
-            let prefix_len = last.len().saturating_sub(state.rollback_tokens);
-            last[..prefix_len].to_vec()
-        } else {
-            Vec::new()
-        };
+        let prefix_ids = self.streaming_rollback_prefix_ids(state)?;
         if !prefix_ids.is_empty() {
             let prefix_tensor = Tensor::from_slice_i64(&prefix_ids).to_device(state.device);
             let prefix_embeds = self.text_decoder.embed(&prefix_tensor).unsqueeze(0);
@@ -1282,6 +1270,104 @@ impl AsrInference {
         state.audio_tokens_in_cache = fchunks * tpc;
 
         Ok(logits)
+    }
+
+    /// Build rollback prefix token IDs for streaming, matching the official
+    /// vLLM path: decode the accumulated output to text, re-encode, roll
+    /// back `rollback_tokens`, and verify the prefix decodes cleanly (no
+    /// U+FFFD). Raw token-ID slicing breaks BPE boundaries in multilingual
+    /// / code-switched output and poisons the KV cache on the next call.
+    fn streaming_rollback_prefix_ids(&self, state: &StreamingState) -> Result<Vec<i64>> {
+        if state.rollback_tokens == 0 || state.last_generated_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let raw = self.tokenizer.decode(&state.last_generated_ids)?;
+        let cur_ids = self.tokenizer.encode(&raw)?;
+        if cur_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut k = state.rollback_tokens;
+        loop {
+            let end_idx = cur_ids.len().saturating_sub(k);
+            if end_idx == 0 {
+                return Ok(Vec::new());
+            }
+            let prefix_ids = cur_ids[..end_idx].to_vec();
+            let prefix_text = self.tokenizer.decode(&prefix_ids)?;
+            if !prefix_text.contains('\u{FFFD}') {
+                return Ok(prefix_ids);
+            }
+            k += 1;
+            if k > cur_ids.len() {
+                tracing::warn!(
+                    "[streaming] rollback prefix never UTF-8 clean (len={}), skipping prefix",
+                    cur_ids.len()
+                );
+                return Ok(Vec::new());
+            }
+        }
+    }
+}
+
+/// Greedy decoding can lock onto a single token or a short cycle.
+/// Streaming uses tighter thresholds so poisoned output never reaches
+/// `last_generated_ids` (which becomes the next call's KV prefix).
+const STREAMING_REPEAT_RUN: usize = 6; // same token in a row during streaming
+const STREAMING_REPEAT_CYCLE: usize = 4; // period 2..=4 during streaming
+const OFFLINE_REPEAT_RUN: usize = 20; // matches official detect_and_fix_repetitions
+const OFFLINE_REPEAT_CYCLE: usize = 12;
+
+fn detect_streaming_runaway(ids: &[i64]) -> Option<usize> {
+    detect_tail_repetition_with(ids, STREAMING_REPEAT_RUN, STREAMING_REPEAT_CYCLE)
+}
+
+fn detect_tail_repetition(ids: &[i64]) -> Option<usize> {
+    detect_tail_repetition_with(ids, OFFLINE_REPEAT_RUN, OFFLINE_REPEAT_CYCLE)
+}
+
+fn detect_tail_repetition_with(ids: &[i64], run_thresh: usize, cycle_thresh: usize) -> Option<usize> {
+    let n = ids.len();
+    for period in 1..=4usize {
+        let need = if period == 1 { run_thresh } else { cycle_thresh };
+        if n < period * need {
+            continue;
+        }
+        let cycle = &ids[n - period..];
+        let repeated = (1..need).all(|r| {
+            let start = n - period * (r + 1);
+            ids[start..start + period] == *cycle
+        });
+        if repeated {
+            return Some(period);
+        }
+    }
+    None
+}
+
+/// Collapse a runaway repeated tail down to a single cycle occurrence
+/// (mirrors the official text-level fix, but at token level so the
+/// cleaned text never reaches the rollback prefix of the next call).
+fn collapse_tail_repetition(ids: &mut Vec<i64>, period: usize) {
+    let n = ids.len();
+    let cycle: Vec<i64> = ids[n - period..].to_vec();
+    let mut end = n - period;
+    while end >= period && ids[end - period..end] == cycle[..] {
+        end -= period;
+    }
+    ids.truncate(end + period);
+    tracing::warn!(
+        "[repetition] collapsed runaway tail: period={} removed={} tokens",
+        period,
+        n - (end + period)
+    );
+}
+
+/// Strip runaway tails before persisting generated IDs into streaming state.
+fn sanitize_for_rollback(ids: &mut Vec<i64>) {
+    while let Some(period) = detect_streaming_runaway(ids) {
+        collapse_tail_repetition(ids, period);
     }
 }
 
