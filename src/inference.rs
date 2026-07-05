@@ -476,25 +476,20 @@ impl AsrInference {
         let t_start = std::time::Instant::now();
 
         // Step 1: Compute mel (incremental: only new frames are STFT'd)
-        let mel = self
-            .mel_extractor
-            .extract_streaming(samples, &mut state.mel_cache, self.device)?;
+        let mel =
+            self.mel_extractor
+                .extract_streaming(samples, &mut state.mel_cache, self.device)?;
         let total_mel_frames = mel.size()[1] as usize;
 
         // Determine how many frames to process.
-        // - allow_tail=true (final): process all frames.
-        // - allow_tail=false (partial): process up to the last complete chunk
-        //   boundary, OR all frames if there's no tail (naturally aligned).
-        let full_frames = (total_mel_frames / chunk_size) * chunk_size;
-        let mel_frames_to_use = if allow_tail {
-            total_mel_frames
-        } else {
-            full_frames
-        };
+        // Both partial and final modes process ALL available frames
+        // (including tail). The tail is re-encoded each call (cheap: ~50
+        // frames), but this gives the user immediate feedback instead of
+        // waiting for a full 100-frame chunk to accumulate.
+        let mel_frames_to_use = total_mel_frames;
 
-        // Skip if no new frames to process.
-        if mel_frames_to_use == 0 || (mel_frames_to_use <= state.cached_mel_frames && !allow_tail) {
-            // Nothing new to encode. Return empty result.
+        // Skip only if literally no new audio at all.
+        if mel_frames_to_use == 0 {
             return Ok(TranscribeResult {
                 text: String::new(),
                 language: String::new(),
@@ -1077,7 +1072,12 @@ impl AsrInference {
         short_hidden.eval();
         let short_cos = state.cos.narrow(0, 0, short_seq_len as i64);
         let short_sin = state.sin.narrow(0, 0, short_seq_len as i64);
-        let short_mask = create_causal_mask(short_seq_len as i64, 0, self.text_decoder.dtype(), state.device);
+        let short_mask = create_causal_mask(
+            short_seq_len as i64,
+            0,
+            self.text_decoder.dtype(),
+            state.device,
+        );
         let mut short_cache = KvCache::new(text_config.num_hidden_layers);
         let short_logits = self.text_decoder.forward(
             &short_hidden,
@@ -1265,7 +1265,12 @@ impl AsrInference {
         let post_pos_start = (PRE_AUDIO_TOKEN_COUNT + num_audio_tokens) as i64;
         let cos = state.cos.narrow(0, post_pos_start, total_len as i64);
         let sin = state.sin.narrow(0, post_pos_start, total_len as i64);
-        let mask = create_causal_mask(total_len as i64, state.cache_seq_len, self.text_decoder.dtype(), state.device);
+        let mask = create_causal_mask(
+            total_len as i64,
+            state.cache_seq_len,
+            self.text_decoder.dtype(),
+            state.device,
+        );
 
         let logits = self
             .text_decoder
