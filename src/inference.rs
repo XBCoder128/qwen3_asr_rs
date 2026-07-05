@@ -180,7 +180,7 @@ impl AsrInference {
                 break;
             }
             generated_ids.push(token);
-            if let Some(period) = detect_streaming_runaway(&generated_ids) {
+            if let Some(period) = detect_tail_repetition(&generated_ids) {
                 collapse_tail_repetition(&mut generated_ids, period);
                 break;
             }
@@ -623,7 +623,7 @@ impl AsrInference {
                 break;
             }
             generated_ids.push(token);
-            if let Some(period) = detect_streaming_runaway(&generated_ids) {
+            if let Some(period) = detect_tail_repetition(&generated_ids) {
                 collapse_tail_repetition(&mut generated_ids, period);
                 tracing::warn!(
                     "[streaming] runaway decode stopped (period={}) — KV prefix will not carry repeats",
@@ -1335,26 +1335,22 @@ impl AsrInference {
     }
 }
 
-/// Greedy decoding can lock onto a single token or a short cycle.
-/// Streaming uses tighter thresholds so poisoned output never reaches
-/// `last_generated_ids` (which becomes the next call's KV prefix).
-const STREAMING_REPEAT_RUN: usize = 6; // same token in a row during streaming
-const STREAMING_REPEAT_CYCLE: usize = 4; // period 2..=4 during streaming
-const OFFLINE_REPEAT_RUN: usize = 20; // matches official detect_and_fix_repetitions
-const OFFLINE_REPEAT_CYCLE: usize = 12;
-
-fn detect_streaming_runaway(ids: &[i64]) -> Option<usize> {
-    detect_tail_repetition_with(ids, STREAMING_REPEAT_RUN, STREAMING_REPEAT_CYCLE)
-}
+/// Runaway short-cycle detection. Thresholds are deliberately conservative
+/// (matching the official `detect_and_fix_repetitions` threshold=20 for
+/// single-token runs): legitimate speech contains runs like "哈哈哈哈哈哈"
+/// or "666666" and repeated emphasis phrases, which must NOT be touched.
+/// True runaway loops blow far past these counts.
+const REPEAT_RUN_THRESHOLD: usize = 20; // period-1: same token repeated
+const REPEAT_CYCLE_THRESHOLD: usize = 12; // period 2..=4 cycles
 
 fn detect_tail_repetition(ids: &[i64]) -> Option<usize> {
-    detect_tail_repetition_with(ids, OFFLINE_REPEAT_RUN, OFFLINE_REPEAT_CYCLE)
-}
-
-fn detect_tail_repetition_with(ids: &[i64], run_thresh: usize, cycle_thresh: usize) -> Option<usize> {
     let n = ids.len();
     for period in 1..=4usize {
-        let need = if period == 1 { run_thresh } else { cycle_thresh };
+        let need = if period == 1 {
+            REPEAT_RUN_THRESHOLD
+        } else {
+            REPEAT_CYCLE_THRESHOLD
+        };
         if n < period * need {
             continue;
         }
@@ -1390,44 +1386,45 @@ fn collapse_tail_repetition(ids: &mut Vec<i64>, period: usize) {
 
 /// Strip runaway tails before persisting generated IDs into streaming state.
 fn sanitize_for_rollback(ids: &mut Vec<i64>) {
-    while let Some(period) = detect_streaming_runaway(ids) {
+    while let Some(period) = detect_tail_repetition(ids) {
         collapse_tail_repetition(ids, period);
     }
 }
 
-/// Detect and trim long repeated subsequences at the end of `ids`.
+/// Collapse a hallucinated sentence loop at the tail of `ids`.
 ///
-/// If the last `len` tokens (len >= MIN_REPEAT) appear earlier in the
-/// sequence (non-overlapping), truncate the repeated tail. Loops until no
-/// repeat remains, so a sentence hallucinated 3+ times in a row is reduced
-/// to a single occurrence (one copy trimmed per pass).
+/// Only fires on 3+ IMMEDIATELY CONSECUTIVE copies of the same 5..=24-token
+/// phrase at the very end (e.g. the same sentence emitted back-to-back
+/// three times). It deliberately does NOT match the tail against earlier,
+/// non-adjacent positions: real speech legitimately repeats phrases
+/// ("以前也不懂……现在也不懂……"), and matching anywhere-earlier deletes
+/// freshly decoded normal text. Saying the same phrase twice in a row is
+/// also left untouched — only 3+ exact adjacent copies are collapsed.
 fn trim_repeated_tail(ids: &mut Vec<i64>) {
-    while trim_repeated_tail_once(ids) {}
-}
+    const MIN_PERIOD: usize = 5;
+    const MAX_PERIOD: usize = 24;
+    const MIN_COPIES: usize = 3;
 
-fn trim_repeated_tail_once(ids: &mut Vec<i64>) -> bool {
-    const MIN_REPEAT: usize = 6;
     let n = ids.len();
-    if n < MIN_REPEAT * 2 {
-        return false;
-    }
-    // Try from longest possible repeat down to MIN_REPEAT.
-    for len in (MIN_REPEAT..=n / 2).rev() {
-        let tail = &ids[n - len..n];
-        // Search for tail in ids[0..n-len], non-overlapping.
-        for start in 0..=n - len - len {
-            if ids[start..start + len] == *tail {
-                ids.truncate(n - len);
-                tracing::warn!(
-                    "[streaming] trimmed {} repeated tokens (matched at pos {})",
-                    len,
-                    start
-                );
-                return true;
-            }
+    for period in MIN_PERIOD..=MAX_PERIOD.min(n / MIN_COPIES) {
+        let tail = &ids[n - period..];
+        let mut copies = 1;
+        while n >= period * (copies + 1)
+            && ids[n - period * (copies + 1)..n - period * copies] == *tail
+        {
+            copies += 1;
+        }
+        if copies >= MIN_COPIES {
+            // Keep a single copy of the phrase.
+            ids.truncate(n - period * (copies - 1));
+            tracing::warn!(
+                "[repetition] collapsed {} adjacent copies of a {}-token phrase",
+                copies,
+                period
+            );
+            return;
         }
     }
-    false
 }
 
 fn parse_asr_output(raw: &str, language_forced: bool) -> (String, String) {
