@@ -188,17 +188,39 @@ Test audio files:
 
 ## Performance Notes
 
-Benchmarked on Apple Silicon (MLX, 0.6B model, sample1.wav → 31 tokens):
-- First run includes Metal shader compilation (~3.0s)
-- Warm runs: ~2.3s
-- Decode loop is the bottleneck (28 layers × 31 steps × 7+ matmuls per layer)
+Benchmarked on Apple M4 (MLX, 0.6B model):
+- Offline sample1.wav (8s → 31 tokens): ~1.5s warm
+- Streaming (1s chunks, rollback=5): ~0.35–0.45s per chunk end-to-end
+
+### BF16 inference (CRITICAL)
+Weights are stored BF16 on disk and are kept BF16 at load time. ALL
+activations, RoPE cos/sin tables, attention masks, and mel input must be
+cast to the model dtype (`text_decoder.dtype()` / `audio_encoder.dtype()`).
+Any strongly-typed f32 array entering the graph (f32 cos/sin, f32 mask,
+f32 scalar created via `MlxArray::scalar_f32`) promotes the whole graph to
+f32, which inserts an implicit `astype` of EVERY weight on EVERY forward
+pass — this was a ~4x decode slowdown. `ops::gelu` casts its 1.702
+coefficient to the input dtype for this reason; follow the same pattern
+for any new scalar constants.
+
+### Streaming-specific optimizations (applied)
+- **Incremental mel/STFT cache** (`MelCache` in `mel.rs`): only new frames
+  are STFT'd per call; the global log-mel normalization is re-applied to the
+  full cached spectrogram (cheap). STFT itself is batched: one gather +
+  one batched rFFT instead of per-frame slice/rfft graph nodes.
+- **Pipelined decode loop**: argmax token stays on-device and feeds the next
+  forward directly; `Tensor::async_eval` queues step i+1 before the CPU
+  reads token i for the EOS check.
+- **No per-call `clear_cache()`**: MLX buffer cache is only cleared when it
+  exceeds 3 GB. Clearing every call forced Metal buffer re-allocation and
+  was a large per-call cost.
+- Prefill builds hidden states via `cat([pre, audio, post, ...])` (audio
+  positions are contiguous) — no per-token `slice_scatter`/`get` loops.
 
 ## Future Optimization Opportunities
 
 1. **Fused RoPE integration**: Use `mlx_fast_rope` with offset parameter instead of precomputed cos/sin tensors. Since all 3 MRoPE dims are identical, this would work with a single offset. Requires changing the attention layer interface.
 
-2. **Pre-allocated KV cache**: Currently each decode step allocates new tensors via `Tensor::cat([past, new])`. Pre-allocating max-size buffers and writing into them would eliminate repeated allocation/copy.
+2. **Pre-allocated KV cache**: Currently each decode step allocates new tensors via `Tensor::cat([past, new])` (O(cache_len) copy per step per layer). Pre-allocating capacity in blocks and writing via `mlx_slice_update` (mlx-lm's KVCache pattern) would eliminate this; matters most for long audio.
 
 3. **Conv2d weight pre-transpose**: Store weights in MLX NHWC format at load time to avoid per-forward transpose (minor, audio encoder only).
-
-4. **BFloat16 inference**: Run the model in BF16 instead of F32 to halve memory bandwidth (currently all weights converted to F32 at load time).

@@ -113,30 +113,19 @@ impl AsrInference {
         let (input_ids, audio_positions) = self.build_prompt(num_audio_tokens, language)?;
         let seq_len = input_ids.len();
 
-        // Step 5: Build embeddings with audio injection
-        let input_tensor = Tensor::from_slice_i64(&input_ids).to_device(self.device);
-        let mut hidden_states = self.text_decoder.embed(&input_tensor).unsqueeze(0);
-
-        // Replace audio_pad positions with audio encoder embeddings.
-        // For long audio, this loop creates a deep computation graph in MLX's
-        // lazy eval. We eval() periodically to break the chain and free
-        // intermediate tensors — otherwise memory grows linearly with the
-        // number of audio tokens.
-        for (embed_idx, &seq_pos) in audio_positions.iter().enumerate() {
-            let audio_embed = audio_embeds.get(embed_idx as i64);
-            hidden_states = hidden_states.slice_scatter(
-                &audio_embed.unsqueeze(0).unsqueeze(0),
-                1,
-                seq_pos as i64,
-                seq_pos as i64 + 1,
-                1,
-            );
-            // Materialize every 32 tokens to break the computation graph.
-            if embed_idx % 32 == 31 {
-                hidden_states.eval();
-            }
-        }
-        hidden_states.eval(); // Final materialize
+        // Step 5: Build embeddings with audio injection.
+        // Audio pad positions are contiguous, so instead of scattering token
+        // by token we embed the text tokens before/after the audio block and
+        // concatenate: [pre_text, audio_embeds, post_text]. One graph op
+        // instead of N slice_scatters.
+        let audio_start = audio_positions[0];
+        let audio_end = audio_start + num_audio_tokens;
+        let pre_tensor = Tensor::from_slice_i64(&input_ids[..audio_start]).to_device(self.device);
+        let post_tensor = Tensor::from_slice_i64(&input_ids[audio_end..]).to_device(self.device);
+        let pre_embeds = self.text_decoder.embed(&pre_tensor).unsqueeze(0);
+        let post_embeds = self.text_decoder.embed(&post_tensor).unsqueeze(0);
+        let hidden_states = Tensor::cat(&[pre_embeds, audio_embeds.unsqueeze(0), post_embeds], 1);
+        hidden_states.eval();
 
         // Step 6: Precompute MRoPE cos/sin for all positions (prefill + max decode)
         let text_config = &self.config.thinker_config.text_config;
@@ -146,6 +135,7 @@ impl AsrInference {
         let all_positions: Vec<i64> = (0..max_total_positions as i64).collect();
         let all_pos_ids: [Vec<i64>; 3] =
             [all_positions.clone(), all_positions.clone(), all_positions];
+        let model_dtype = self.text_decoder.dtype();
         let (all_cos, all_sin) = compute_mrope_cos_sin(
             &all_pos_ids,
             text_config.head_dim,
@@ -154,13 +144,17 @@ impl AsrInference {
             text_config.mrope_interleaved(),
             self.device,
         );
+        // Keep RoPE tables in the model dtype: f32 cos/sin would promote the
+        // whole attention graph (and the KV cache) to f32.
+        let all_cos = all_cos.to_dtype(model_dtype);
+        let all_sin = all_sin.to_dtype(model_dtype);
 
         // Prefill cos/sin: positions 0..seq_len
         let cos = all_cos.narrow(0, 0, seq_len as i64);
         let sin = all_sin.narrow(0, 0, seq_len as i64);
 
         // Step 7: Prefill
-        let mask = create_causal_mask(seq_len as i64, 0, self.device);
+        let mask = create_causal_mask(seq_len as i64, 0, model_dtype, self.device);
         let mut kv_cache = KvCache::new(text_config.num_hidden_layers);
 
         let logits =
@@ -169,38 +163,38 @@ impl AsrInference {
         // Eval prefill output to materialize computation graph before decode loop
         logits.eval();
 
-        // Step 8: Autoregressive generation
+        // Step 8: Autoregressive generation (pipelined greedy decode: the
+        // GPU computes step i+1 while the CPU checks step i for EOS).
         let mut generated_ids: Vec<i64> = Vec::new();
         let eos_token_ids = vec![ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID];
 
-        let mut next_logits = logits.narrow(1, seq_len as i64 - 1, 1).squeeze_dim(1);
-
+        let first_logits = logits.narrow(1, seq_len as i64 - 1, 1).squeeze_dim(1);
         let mut current_pos = seq_len;
 
+        let mut token_arr = first_logits.argmax(-1, false);
+        Tensor::async_eval(&[&token_arr]);
+
         for _ in 0..max_new_tokens {
-            let next_token = next_logits.argmax(-1, false).int64_value(&[0]);
-
-            if eos_token_ids.contains(&next_token) {
-                break;
-            }
-
-            generated_ids.push(next_token);
-
-            let next_input = Tensor::from_slice_i64(&[next_token]).to_device(self.device);
-            let next_hidden = self.text_decoder.embed(&next_input).unsqueeze(0);
+            let next_hidden = self.text_decoder.embed(&token_arr).unsqueeze(0);
 
             // Index into precomputed cos/sin for this position
             let new_cos = all_cos.narrow(0, current_pos as i64, 1);
             let new_sin = all_sin.narrow(0, current_pos as i64, 1);
 
             // Single-token decode: causal mask is all-zeros (no masking needed)
-            next_logits =
-                self.text_decoder
-                    .forward(&next_hidden, &new_cos, &new_sin, &mut kv_cache, None);
-            next_logits = next_logits.squeeze_dim(1);
-            // Materialize to prevent the decode loop from building a deep graph.
-            next_logits.eval();
+            let next_logits = self
+                .text_decoder
+                .forward(&next_hidden, &new_cos, &new_sin, &mut kv_cache, None)
+                .squeeze_dim(1);
+            let next_token_arr = next_logits.argmax(-1, false);
+            Tensor::async_eval(&[&next_token_arr]);
 
+            let token = token_arr.int64_value(&[0]);
+            if eos_token_ids.contains(&token) {
+                break;
+            }
+            generated_ids.push(token);
+            token_arr = next_token_arr;
             current_pos += 1;
         }
 
@@ -348,6 +342,9 @@ pub struct StreamingState {
     cached_audio_embeds: Option<Tensor>,
     /// Number of mel frames already encoded (for incremental encoding).
     cached_mel_frames: usize,
+    /// Incremental STFT/mel cache (avoids recomputing the full spectrogram
+    /// over the accumulated audio on every call).
+    mel_cache: crate::mel::MelCache,
     /// Token IDs generated in the previous call (for prefix rollback).
     last_generated_ids: Vec<i64>,
     /// Number of trailing tokens to re-decode each call. The preceding
@@ -411,6 +408,12 @@ impl AsrInference {
             text_config.mrope_interleaved(),
             self.device,
         );
+        // Keep RoPE tables in the model dtype (bf16 on MLX): f32 cos/sin
+        // would promote the attention graph and KV cache to f32, forcing an
+        // implicit weight up-cast on every forward pass.
+        let model_dtype = self.text_decoder.dtype();
+        let cos = cos.to_dtype(model_dtype);
+        let sin = sin.to_dtype(model_dtype);
 
         // Embed pre-audio tokens once.
         let pre_tensor = Tensor::from_slice_i64(&pre_audio_ids).to_device(self.device);
@@ -426,6 +429,7 @@ impl AsrInference {
             pre_audio_embeds,
             cached_audio_embeds: None,
             cached_mel_frames: 0,
+            mel_cache: crate::mel::MelCache::default(),
             last_generated_ids: Vec::new(),
             rollback_tokens,
             forced_language,
@@ -471,8 +475,10 @@ impl AsrInference {
 
         let t_start = std::time::Instant::now();
 
-        // Step 1: Compute mel
-        let mel = self.mel_extractor.extract(samples, self.device)?;
+        // Step 1: Compute mel (incremental: only new frames are STFT'd)
+        let mel = self
+            .mel_extractor
+            .extract_streaming(samples, &mut state.mel_cache, self.device)?;
         let total_mel_frames = mel.size()[1] as usize;
 
         // Determine how many frames to process.
@@ -579,7 +585,7 @@ impl AsrInference {
 
         // logits has shape (1, num_prefilled, vocab_size). We need the last one.
         let logits_seq_len = logits.size()[1];
-        let mut next_logits = logits.narrow(1, logits_seq_len - 1, 1).squeeze_dim(1);
+        let first_logits = logits.narrow(1, logits_seq_len - 1, 1).squeeze_dim(1);
         let mut current_pos = seq_len;
 
         // When rollback_tokens > 0, the prefix text was already prefilled in
@@ -596,23 +602,30 @@ impl AsrInference {
         };
         let mut generated_ids = prefix_ids.clone();
 
-        for _ in 0..max_new_tokens {
-            let next_token = next_logits.argmax(-1, false).int64_value(&[0]);
-            if eos_token_ids.contains(&next_token) {
-                break;
-            }
-            generated_ids.push(next_token);
+        // Pipelined greedy decode: keep the argmax token on-device and feed
+        // it straight into the next forward pass, queue that step with
+        // async_eval, and only then read back the *current* token. The GPU
+        // computes step i+1 while the CPU checks step i for EOS.
+        let mut token_arr = first_logits.argmax(-1, false);
+        Tensor::async_eval(&[&token_arr]);
 
-            let next_input = Tensor::from_slice_i64(&[next_token]).to_device(state.device);
-            let next_hidden = self.text_decoder.embed(&next_input).unsqueeze(0);
+        for _ in 0..max_new_tokens {
+            let next_hidden = self.text_decoder.embed(&token_arr).unsqueeze(0);
             let new_cos = state.cos.narrow(0, current_pos, 1);
             let new_sin = state.sin.narrow(0, current_pos, 1);
+            let next_logits = self
+                .text_decoder
+                .forward(&next_hidden, &new_cos, &new_sin, kv_cache, None)
+                .squeeze_dim(1);
+            let next_token_arr = next_logits.argmax(-1, false);
+            Tensor::async_eval(&[&next_token_arr]);
 
-            next_logits =
-                self.text_decoder
-                    .forward(&next_hidden, &new_cos, &new_sin, kv_cache, None);
-            next_logits = next_logits.squeeze_dim(1);
-            next_logits.eval();
+            let token = token_arr.int64_value(&[0]);
+            if eos_token_ids.contains(&token) {
+                break;
+            }
+            generated_ids.push(token);
+            token_arr = next_token_arr;
             current_pos += 1;
         }
 
@@ -640,11 +653,16 @@ impl AsrInference {
             t_total.as_millis()
         );
 
-        // Cleanup
+        // Cleanup: clearing the MLX buffer cache every call forces Metal to
+        // re-allocate every buffer from the OS on the next call, which is
+        // expensive. Only clear when the cache grows past a threshold.
         #[cfg(feature = "mlx")]
         {
-            crate::backend::mlx::stream::synchronize();
-            crate::backend::mlx::stream::clear_cache();
+            const CACHE_LIMIT_BYTES: usize = 3 << 30; // 3 GB
+            if crate::backend::mlx::stream::cache_memory() > CACHE_LIMIT_BYTES {
+                crate::backend::mlx::stream::synchronize();
+                crate::backend::mlx::stream::clear_cache();
+            }
         }
 
         let raw_text = self.tokenizer.decode(&generated_ids)?;
@@ -675,28 +693,19 @@ impl AsrInference {
             + POST_AUDIO_TOKENS.len()
             + state.language_prefix_ids.len();
 
-        // Build hidden states: pre_audio + audio + post_audio + language_prefix
-        let mut hidden_states = state.pre_audio_embeds.shallow_clone();
-
-        // Inject audio embeddings
-        for i in 0..num_audio_tokens {
-            let embed = audio_embeds.get(i as i64);
-            hidden_states = hidden_states.slice_scatter(
-                &embed.unsqueeze(0).unsqueeze(0),
-                1,
-                (PRE_AUDIO_TOKEN_COUNT + i) as i64,
-                (PRE_AUDIO_TOKEN_COUNT + i + 1) as i64,
-                1,
-            );
-            if i % 32 == 31 {
-                hidden_states.eval();
-            }
-        }
-
-        // Append post-audio tokens
+        // Build hidden states: pre_audio + audio + post_audio + language_prefix.
+        // pre_audio_embeds covers positions 0..PRE_AUDIO_TOKEN_COUNT and the
+        // audio block is contiguous right after it, so a single concat works.
         let post_tensor = Tensor::from_slice_i64(POST_AUDIO_TOKENS).to_device(state.device);
         let post_embeds = self.text_decoder.embed(&post_tensor).unsqueeze(0);
-        hidden_states = Tensor::cat(&[hidden_states, post_embeds], 1);
+        let mut hidden_states = Tensor::cat(
+            &[
+                state.pre_audio_embeds.shallow_clone(),
+                audio_embeds.unsqueeze(0),
+                post_embeds,
+            ],
+            1,
+        );
 
         // Append language prefix tokens (e.g. "language English")
         if !state.language_prefix_ids.is_empty() {
@@ -710,7 +719,7 @@ impl AsrInference {
         // Cos/sin + mask for full prefill
         let cos = state.cos.narrow(0, 0, seq_len as i64);
         let sin = state.sin.narrow(0, 0, seq_len as i64);
-        let mask = create_causal_mask(seq_len as i64, 0, state.device);
+        let mask = create_causal_mask(seq_len as i64, 0, self.text_decoder.dtype(), state.device);
 
         let mut kv_cache = KvCache::new(text_config.num_hidden_layers);
         let logits =
@@ -827,10 +836,12 @@ impl AsrInference {
         );
 
         // Build hidden states: new audio embeds + post-audio embeds + language prefix + rollback prefix text embeds
-        let mut parts: Vec<Tensor> = Vec::with_capacity(total_new);
-        for i in old_audio..num_audio_tokens {
-            parts.push(audio_embeds.get(i as i64).unsqueeze(0).unsqueeze(0));
-        }
+        let mut parts: Vec<Tensor> = Vec::with_capacity(4);
+        parts.push(
+            audio_embeds
+                .narrow(0, old_audio as i64, num_new as i64)
+                .unsqueeze(0),
+        );
         let post_tensor = Tensor::from_slice_i64(POST_AUDIO_TOKENS).to_device(state.device);
         let post_embeds = self.text_decoder.embed(&post_tensor).unsqueeze(0);
         parts.push(post_embeds);
@@ -849,7 +860,12 @@ impl AsrInference {
 
         let cos = state.cos.narrow(0, pos_start, total_new as i64);
         let sin = state.sin.narrow(0, pos_start, total_new as i64);
-        let mask = create_causal_mask(total_new as i64, truncate_len, state.device);
+        let mask = create_causal_mask(
+            total_new as i64,
+            truncate_len,
+            self.text_decoder.dtype(),
+            state.device,
+        );
 
         // Pre-forward diagnostics.
         tracing::info!(
@@ -928,7 +944,7 @@ impl AsrInference {
 
         let cos = state.cos.narrow(0, 0, seq_len as i64);
         let sin = state.sin.narrow(0, 0, seq_len as i64);
-        let mask = create_causal_mask(seq_len as i64, 0, state.device);
+        let mask = create_causal_mask(seq_len as i64, 0, self.text_decoder.dtype(), state.device);
 
         let mut fresh_cache = KvCache::new(text_config.num_hidden_layers);
         let fresh_logits =
@@ -1046,7 +1062,7 @@ impl AsrInference {
         hidden_states.eval();
         let cos = state.cos.narrow(0, 0, seq_len as i64);
         let sin = state.sin.narrow(0, 0, seq_len as i64);
-        let mask = create_causal_mask(seq_len as i64, 0, state.device);
+        let mask = create_causal_mask(seq_len as i64, 0, self.text_decoder.dtype(), state.device);
         let mut fresh_cache = KvCache::new(text_config.num_hidden_layers);
         let fresh_logits =
             self.text_decoder
@@ -1095,7 +1111,7 @@ impl AsrInference {
         short_hidden.eval();
         let short_cos = state.cos.narrow(0, 0, short_seq_len as i64);
         let short_sin = state.sin.narrow(0, 0, short_seq_len as i64);
-        let short_mask = create_causal_mask(short_seq_len as i64, 0, state.device);
+        let short_mask = create_causal_mask(short_seq_len as i64, 0, self.text_decoder.dtype(), state.device);
         let mut short_cache = KvCache::new(text_config.num_hidden_layers);
         let short_logits = self.text_decoder.forward(
             &short_hidden,
@@ -1192,7 +1208,7 @@ impl AsrInference {
         hidden_states.eval();
         let cos = state.cos.narrow(0, 0, seq_len as i64);
         let sin = state.sin.narrow(0, 0, seq_len as i64);
-        let mask = create_causal_mask(seq_len as i64, 0, state.device);
+        let mask = create_causal_mask(seq_len as i64, 0, self.text_decoder.dtype(), state.device);
         let mut fresh_cache = KvCache::new(text_config.num_hidden_layers);
         let fresh_logits =
             self.text_decoder
@@ -1267,7 +1283,7 @@ impl AsrInference {
         let post_pos_start = (PRE_AUDIO_TOKEN_COUNT + num_audio_tokens) as i64;
         let cos = state.cos.narrow(0, post_pos_start, total_len as i64);
         let sin = state.sin.narrow(0, post_pos_start, total_len as i64);
-        let mask = create_causal_mask(total_len as i64, state.cache_seq_len, state.device);
+        let mask = create_causal_mask(total_len as i64, state.cache_seq_len, self.text_decoder.dtype(), state.device);
 
         let logits = self
             .text_decoder

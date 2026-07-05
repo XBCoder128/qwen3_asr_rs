@@ -60,12 +60,17 @@ impl AudioEncoder {
         let proj1 = Linear::load(weights, &format!("{}.proj1", prefix))?;
         let proj2 = Linear::load(weights, &format!("{}.proj2", prefix))?;
 
+        // Match the weight dtype (bf16 for MLX) so the whole encoder runs in
+        // that dtype without implicit up-casting of weights per forward.
+        let model_dtype = conv2d1.weight.kind();
+
         // Create sinusoidal positional embedding
         let positional_embedding = create_sinusoidal_embedding(
             config.max_source_positions,
             config.d_model as usize,
             device,
-        );
+        )
+        .to_dtype(model_dtype);
 
         Ok(Self {
             conv2d1,
@@ -92,8 +97,16 @@ impl AudioEncoder {
         self.chunk_local = enabled;
     }
 
+    /// The dtype the encoder weights are stored in.
+    pub fn dtype(&self) -> DType {
+        self.conv2d1.weight.kind()
+    }
+
     /// Encode mel spectrogram features into continuous audio embeddings.
     pub fn forward(&self, mel_features: &Tensor) -> Tensor {
+        // Cast the (f32) mel input to the model dtype up-front so every
+        // subsequent op stays in the weight dtype (no implicit promotion).
+        let mel_features = &mel_features.to_dtype(self.dtype());
         let num_frames = mel_features.size()[1] as usize;
 
         // Chunk size = n_window * 2
@@ -134,7 +147,7 @@ impl AudioEncoder {
             let pad_frames = chunk_size - tail_frames;
             let pad = Tensor::zeros(
                 &[mel_features.size()[0], pad_frames as i64],
-                DType::Float32,
+                self.dtype(),
                 device,
             );
             let padded_mel = Tensor::cat(&[tail_mel, pad], 1).unsqueeze(0);
@@ -262,14 +275,16 @@ impl AudioEncoder {
             token_offset += window_tokens;
         }
 
-        // Build the mask tensor
+        // Build the mask tensor (in the model dtype to avoid promoting the
+        // fused SDPA inputs).
+        let mask_dtype = self.dtype();
         let neg_inf = Tensor::full(
             &[1, 1, total_tokens, total_tokens],
             f64::NEG_INFINITY,
-            DType::Float32,
+            mask_dtype,
             device,
         );
-        let zero = Tensor::zeros(&[1, 1, total_tokens, total_tokens], DType::Float32, device);
+        let zero = Tensor::zeros(&[1, 1, total_tokens, total_tokens], mask_dtype, device);
 
         // Create bool mask from data
         // For tch backend: use from_slice + reshape

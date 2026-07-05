@@ -104,6 +104,13 @@ impl TextDecoder {
         Tensor::embedding(&self.embed_tokens, input_ids)
     }
 
+    /// The dtype the model weights are stored in (bf16 for MLX, f32 for tch).
+    /// All activations, masks and RoPE tables must use this dtype to avoid
+    /// implicit weight up-casting on every forward pass.
+    pub fn dtype(&self) -> DType {
+        self.embed_tokens.kind()
+    }
+
     pub fn forward(
         &self,
         hidden_states: &Tensor,
@@ -131,14 +138,9 @@ impl TextDecoder {
 }
 
 /// Create a causal attention mask.
-pub fn create_causal_mask(seq_len: i64, past_len: i64, device: Device) -> Tensor {
+pub fn create_causal_mask(seq_len: i64, past_len: i64, dtype: DType, device: Device) -> Tensor {
     let total_len = past_len + seq_len;
-    let mask = Tensor::full(
-        &[seq_len, total_len],
-        f64::NEG_INFINITY,
-        DType::Float32,
-        device,
-    );
+    let mask = Tensor::full(&[seq_len, total_len], f64::NEG_INFINITY, dtype, device);
     let mask = mask.triu(past_len + 1);
     mask.unsqueeze(0).unsqueeze(0)
 }

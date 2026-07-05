@@ -95,6 +95,8 @@ extern "C" {
     // -----------------------------------------------------------------------
 
     pub fn mlx_array_eval(arr: mlx_array) -> c_int;
+    pub fn mlx_eval(outputs: mlx_vector_array) -> c_int;
+    pub fn mlx_async_eval(outputs: mlx_vector_array) -> c_int;
     pub fn mlx_array_data_float32(arr: mlx_array) -> *const c_float;
     pub fn mlx_array_data_int32(arr: mlx_array) -> *const i32;
     pub fn mlx_array_data_int64(arr: mlx_array) -> *const i64;

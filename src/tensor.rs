@@ -521,6 +521,9 @@ impl Tensor {
     /// Evaluate tensor (no-op for tch which uses eager execution).
     pub fn eval(&self) {}
 
+    /// Asynchronously evaluate tensors (no-op for tch which is eager).
+    pub fn async_eval(_tensors: &[&Tensor]) {}
+
     // -- Data extraction --
 
     pub fn int64_value(&self, indices: &[i64]) -> i64 {
@@ -1013,6 +1016,14 @@ impl Tensor {
     /// Force evaluation of the lazy computation graph for this tensor.
     pub fn eval(&self) {
         self.inner.eval();
+    }
+
+    /// Queue GPU evaluation of the given tensors without blocking.
+    /// Lets the CPU build the next step's graph while the GPU works.
+    pub fn async_eval(tensors: &[&Tensor]) {
+        let refs: Vec<&crate::backend::mlx::array::MlxArray> =
+            tensors.iter().map(|t| &t.inner).collect();
+        crate::backend::mlx::ops::async_eval(&refs);
     }
 
     // -- Data extraction --
