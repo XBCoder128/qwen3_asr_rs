@@ -1316,7 +1316,14 @@ fn trim_repeated_tail(ids: &mut Vec<i64>) {
 
 fn parse_asr_output(raw: &str, language_forced: bool) -> (String, String) {
     if language_forced {
-        return ("forced".to_string(), raw.trim().to_string());
+        let raw = raw.trim();
+        // Model outputs "<asr_text>实际文本", strip the tag.
+        let text = raw
+            .strip_prefix("<asr_text>")
+            .unwrap_or(raw)
+            .trim()
+            .to_string();
+        return ("forced".to_string(), text);
     }
 
     let raw = raw.trim();

@@ -64,7 +64,7 @@ fn main() -> Result<()> {
 
     // --- Incremental streaming only ---
     let t0 = Instant::now();
-    let mut stream_state = model.init_streaming(None, rollback)?;
+    let mut stream_state = model.init_streaming(args.get(5).map(|s| s.as_str()), rollback)?;
     let mut accumulated: Vec<f32> = Vec::new();
     let mut last_text = String::new();
 
