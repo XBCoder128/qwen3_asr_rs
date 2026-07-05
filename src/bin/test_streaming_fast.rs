@@ -24,7 +24,11 @@ fn main() -> Result<()> {
     if args.len() < 3 {
         eprintln!("Fast streaming-only test");
         eprintln!(
-            "Usage: test_streaming_fast <model_dir> <audio_file> [chunk_sec] [rollback_tokens]"
+            "Usage: test_streaming_fast <model_dir> <audio_file> [chunk_sec] [rollback_tokens] [partial]"
+        );
+        eprintln!(
+            "  partial: only decode at complete encoder-chunk (1s) boundaries \
+             (old behavior; default decodes the tail every call)"
         );
         std::process::exit(1);
     }
@@ -33,6 +37,7 @@ fn main() -> Result<()> {
     let audio_file = &args[2];
     let chunk_sec: f64 = args.get(3).map(|s| s.parse().unwrap_or(1.0)).unwrap_or(1.0);
     let rollback: usize = args.get(4).map(|s| s.parse().unwrap_or(3)).unwrap_or(3);
+    let partial_mode = args.get(5).map(|s| s == "partial").unwrap_or(false);
 
     #[cfg(feature = "mlx")]
     {
@@ -72,9 +77,12 @@ fn main() -> Result<()> {
             continue;
         }
 
-        // Use partial (no tail) for intermediate steps.
+        // Default: process the tail every call so the hypothesis updates at
+        // sub-second granularity. "partial" mode skips the tail and only
+        // decodes at complete encoder-chunk (1s) boundaries.
         let is_last = i == num_chunks - 1;
-        let result = if is_last {
+        let t_call = Instant::now();
+        let result = if is_last || !partial_mode {
             model.streaming_transcribe(&accumulated, &mut stream_state)
         } else {
             model.streaming_transcribe_partial(&accumulated, &mut stream_state)
@@ -82,7 +90,13 @@ fn main() -> Result<()> {
         .with_context(|| format!("Failed at chunk {}", i + 1))?;
 
         let acc_dur = accumulated.len() as f64 / SAMPLE_RATE as f64;
-        eprintln!("[chunk {}] {:.1}s → {}", i + 1, acc_dur, result.text);
+        eprintln!(
+            "[chunk {}] {:.1}s ({:.0}ms) → {}",
+            i + 1,
+            acc_dur,
+            t_call.elapsed().as_millis(),
+            result.text
+        );
         last_text = result.text;
 
         #[cfg(feature = "mlx")]

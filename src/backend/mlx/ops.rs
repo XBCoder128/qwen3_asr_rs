@@ -127,6 +127,32 @@ pub fn squeeze(a: &MlxArray, axes: &[i32]) -> MlxArray {
     res
 }
 
+/// Functional slice assignment: returns `src` with `src[start:stop] = update`.
+/// When the source buffer has no other references at eval time, MLX donates
+/// the buffer and performs the update in place (no copy) — this is the
+/// backbone of the preallocated KV cache.
+pub fn slice_update(
+    src: &MlxArray,
+    update: &MlxArray,
+    start: &[i32],
+    stop: &[i32],
+    strides: &[i32],
+) -> MlxArray {
+    let mut res = MlxArray::empty();
+    unsafe {
+        ffi::mlx_slice_update(
+            &mut res.ptr,
+            src.ptr,
+            update.ptr,
+            start.as_ptr(), start.len(),
+            stop.as_ptr(), stop.len(),
+            strides.as_ptr(), strides.len(),
+            default_stream(),
+        );
+    }
+    res
+}
+
 pub fn slice(a: &MlxArray, start: &[i32], stop: &[i32], strides: &[i32]) -> MlxArray {
     let mut res = MlxArray::empty();
     unsafe {

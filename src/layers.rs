@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use anyhow::Result;
 use crate::tensor::{Device, Tensor};
+use crate::text_decoder::KvCache;
 use crate::weights::{get_weight, get_weight_opt};
 
 // ============================================================================
@@ -270,15 +271,17 @@ impl TextAttention {
         })
     }
 
-    /// Forward pass with KV cache support.
+    /// Forward pass with KV cache support. New K/V entries are written into
+    /// the cache's preallocated buffers in place (no O(cache_len) concat).
     pub fn forward(
         &self,
         x: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        kv_cache: Option<&(Tensor, Tensor)>,
+        kv_cache: &mut KvCache,
+        layer_idx: usize,
         mask: Option<&Tensor>,
-    ) -> (Tensor, (Tensor, Tensor)) {
+    ) -> Tensor {
         let (bsz, seq_len, _) = x.size3();
         let nqh = self.num_q_heads as i64;
         let nkvh = self.num_kv_heads as i64;
@@ -297,16 +300,8 @@ impl TextAttention {
         let q = q.apply_rope(cos, sin);
         let k = k.apply_rope(cos, sin);
 
-        // Update KV cache
-        let (k, v) = if let Some((past_k, past_v)) = kv_cache {
-            let k = Tensor::cat(&[past_k.clone(), k], 2);
-            let v = Tensor::cat(&[past_v.clone(), v], 2);
-            (k, v)
-        } else {
-            (k, v)
-        };
-
-        let new_cache = (k.shallow_clone(), v.shallow_clone());
+        // Append to the preallocated cache and get valid-length views.
+        let (k, v) = kv_cache.update_and_fetch(layer_idx, k, v);
 
         // Compute attention using fused SDPA (handles GQA natively)
         let scale = 1.0 / (hd as f64).sqrt();
@@ -314,9 +309,7 @@ impl TextAttention {
 
         // Reshape and project output
         let out = out.transpose(1, 2).reshape(&[bsz, seq_len, nqh * hd]);
-        let out = self.o_proj.forward(&out);
-
-        (out, new_cache)
+        self.o_proj.forward(&out)
     }
 
     fn apply_head_norm(&self, x: &Tensor, norm: &RmsNorm) -> Tensor {
@@ -394,22 +387,21 @@ impl TextDecoderLayer {
         x: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        kv_cache: Option<&(Tensor, Tensor)>,
+        kv_cache: &mut KvCache,
+        layer_idx: usize,
         mask: Option<&Tensor>,
-    ) -> (Tensor, (Tensor, Tensor)) {
+    ) -> Tensor {
         // Pre-norm + self-attention + residual
         let residual = x;
         let h = self.input_layernorm.forward(x);
-        let (h, new_cache) = self.self_attn.forward(&h, cos, sin, kv_cache, mask);
+        let h = self.self_attn.forward(&h, cos, sin, kv_cache, layer_idx, mask);
         let x = &h + residual;
 
         // Pre-norm + MLP + residual
         let residual = x.shallow_clone();
         let h = self.post_attention_layernorm.forward(&x);
         let h = self.mlp.forward(&h);
-        let out = h + residual;
-
-        (out, new_cache)
+        h + residual
     }
 }
 

@@ -189,8 +189,9 @@ Test audio files:
 ## Performance Notes
 
 Benchmarked on Apple M4 (MLX, 0.6B model):
-- Offline sample1.wav (8s → 31 tokens): ~1.5s warm
-- Streaming (1s chunks, rollback=5): ~0.35–0.45s per chunk end-to-end
+- Offline sample5.wav (73s audio): ~6.5s total (~11x realtime)
+- Streaming (1s chunks, rollback=5): ~0.28–0.40s per chunk end-to-end,
+  stable up to 73s audio (no per-chunk latency growth)
 
 ### BF16 inference (CRITICAL)
 Weights are stored BF16 on disk and are kept BF16 at load time. ALL
@@ -202,6 +203,17 @@ f32, which inserts an implicit `astype` of EVERY weight on EVERY forward
 pass — this was a ~4x decode slowdown. `ops::gelu` casts its 1.702
 coefficient to the input dtype for this reason; follow the same pattern
 for any new scalar constants.
+
+### Preallocated KV cache (applied)
+`KvCache` follows mlx-lm's KVCache pattern: per-layer buffers preallocated
+in blocks of 256 positions; new K/V entries are written via
+`mlx_slice_update` (exposed as `Tensor::slice_scatter`), which MLX performs
+in place when the buffer has no other references at eval time (donation).
+Attention reads a `narrow(2, 0, offset)` view. This removes the
+O(cache_len) `cat([past, new])` copy per layer per decode step.
+`truncate()` is O(1) — it only rewinds the offset; stale entries past it
+are overwritten by the next prefill. Do NOT hold long-lived references to
+the internal buffers: that would defeat buffer donation and force copies.
 
 ### Streaming-specific optimizations (applied)
 - **Incremental mel/STFT cache** (`MelCache` in `mel.rs`): only new frames
@@ -221,6 +233,4 @@ for any new scalar constants.
 
 1. **Fused RoPE integration**: Use `mlx_fast_rope` with offset parameter instead of precomputed cos/sin tensors. Since all 3 MRoPE dims are identical, this would work with a single offset. Requires changing the attention layer interface.
 
-2. **Pre-allocated KV cache**: Currently each decode step allocates new tensors via `Tensor::cat([past, new])` (O(cache_len) copy per step per layer). Pre-allocating capacity in blocks and writing via `mlx_slice_update` (mlx-lm's KVCache pattern) would eliminate this; matters most for long audio.
-
-3. **Conv2d weight pre-transpose**: Store weights in MLX NHWC format at load time to avoid per-forward transpose (minor, audio encoder only).
+2. **Conv2d weight pre-transpose**: Store weights in MLX NHWC format at load time to avoid per-forward transpose (minor, audio encoder only).

@@ -518,7 +518,11 @@ impl AsrInference {
         // tail being re-encoded + new frames), concatenate, then update the
         // cache to the new complete-chunk boundary.
         let audio_embeds =
-            if state.cached_mel_frames > 0 && state.cached_mel_frames < total_mel_frames {
+            if state.cached_mel_frames > 0 && state.cached_mel_frames >= total_mel_frames {
+                // No frames beyond the cached complete chunks (e.g. repeated
+                // call with unchanged audio): reuse cached embeddings.
+                state.cached_audio_embeds.as_ref().unwrap().shallow_clone()
+            } else if state.cached_mel_frames > 0 && state.cached_mel_frames < total_mel_frames {
                 let new_frame_start = state.cached_mel_frames;
                 let new_frame_count = total_mel_frames - new_frame_start;
                 let new_mel = mel.narrow(1, new_frame_start as i64, new_frame_count as i64);
@@ -771,13 +775,8 @@ impl AsrInference {
             );
         }
         let truncate_len = truncate_len.min(actual_cache_len);
-        // Force materialize before truncate to avoid stale lazy graph.
-        for layer in &kv_cache.layers {
-            if let Some((k, v)) = layer {
-                k.eval();
-                v.eval();
-            }
-        }
+        // O(1): truncate only rewinds the cache offset; the preallocated
+        // buffers are untouched and stale entries get overwritten below.
         kv_cache.truncate(truncate_len);
         state.cache_seq_len = truncate_len;
 
@@ -809,21 +808,6 @@ impl AsrInference {
 
         let total_new =
             num_new + POST_AUDIO_TOKENS.len() + state.language_prefix_ids.len() + prefix_ids.len();
-
-        // Verify all KV cache layers have the same length before prefill.
-        let cache_lens: Vec<i64> = kv_cache
-            .layers
-            .iter()
-            .map(|l| l.as_ref().map(|(k, _)| k.size()[2]).unwrap_or(0))
-            .collect();
-        let max_len = *cache_lens.iter().max().unwrap_or(&0);
-        let min_len = *cache_lens.iter().min().unwrap_or(&0);
-        if max_len != min_len {
-            tracing::warn!(
-                "[streaming-inc] KV cache layer length mismatch! min={} max={} truncate_len={} total_new={}",
-                min_len, max_len, truncate_len, total_new
-            );
-        }
 
         tracing::debug!(
             "[streaming-inc] truncate_len={} num_new={} pos_start={} total_new={} prefix={} lang={}",
@@ -881,24 +865,6 @@ impl AsrInference {
             .text_decoder
             .forward(&new_hidden, &cos, &sin, kv_cache, Some(&mask));
         logits.eval();
-
-        // Verify KV cache consistency after forward.
-        let post_lens: Vec<i64> = kv_cache
-            .layers
-            .iter()
-            .map(|l| l.as_ref().map(|(k, _)| k.size()[2]).unwrap_or(0))
-            .collect();
-        let post_max = *post_lens.iter().max().unwrap_or(&0);
-        let post_min = *post_lens.iter().min().unwrap_or(&0);
-        if post_max != post_min {
-            tracing::warn!(
-                "[streaming-inc] POST-FORWARD KV mismatch! min={} max={} truncate={} total_new={}",
-                post_min,
-                post_max,
-                truncate_len,
-                total_new
-            );
-        }
 
         state.cache_seq_len += total_new as i64;
         let tpc = self.audio_encoder.tokens_per_chunk();
@@ -1266,7 +1232,9 @@ impl AsrInference {
         state: &mut StreamingState,
         num_audio_tokens: usize,
     ) -> Result<Tensor> {
-        // Build hidden: post_audio + language_prefix
+        // Build hidden: post_audio + language_prefix + rollback prefix text.
+        // The prefix MUST be prefilled here too: the decode loop assumes the
+        // prefix is already in the KV cache whenever rollback is enabled.
         let post_tensor = Tensor::from_slice_i64(POST_AUDIO_TOKENS).to_device(state.device);
         let mut hidden_parts = vec![self.text_decoder.embed(&post_tensor).unsqueeze(0)];
 
@@ -1277,8 +1245,22 @@ impl AsrInference {
             hidden_parts.push(lang_embeds);
         }
 
+        let prefix_ids: Vec<i64> = if state.rollback_tokens > 0 {
+            let last = &state.last_generated_ids;
+            let prefix_len = last.len().saturating_sub(state.rollback_tokens);
+            last[..prefix_len].to_vec()
+        } else {
+            Vec::new()
+        };
+        if !prefix_ids.is_empty() {
+            let prefix_tensor = Tensor::from_slice_i64(&prefix_ids).to_device(state.device);
+            let prefix_embeds = self.text_decoder.embed(&prefix_tensor).unsqueeze(0);
+            hidden_parts.push(prefix_embeds);
+        }
+
         let post_hidden = Tensor::cat(&hidden_parts, 1);
-        let total_len = POST_AUDIO_TOKENS.len() + state.language_prefix_ids.len();
+        let total_len =
+            POST_AUDIO_TOKENS.len() + state.language_prefix_ids.len() + prefix_ids.len();
 
         let post_pos_start = (PRE_AUDIO_TOKEN_COUNT + num_audio_tokens) as i64;
         let cos = state.cos.narrow(0, post_pos_start, total_len as i64);

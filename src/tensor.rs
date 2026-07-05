@@ -831,29 +831,26 @@ impl Tensor {
     }
 
     /// Replaces self[..., start:end:step, ...] along dim with src.
+    /// Uses the native slice_update kernel: when `self` holds the only
+    /// reference to its buffer at eval time, MLX updates it in place.
     pub fn slice_scatter(&self, src: &Tensor, dim: i64, start: i64, end: i64, _step: i64) -> Self {
         let ndim = self.inner.ndim() as usize;
         let dim = if dim < 0 { ndim as i64 + dim } else { dim } as usize;
         let shape = self.inner.shape();
-        let dim_size = shape[dim] as i64;
 
-        // Build: [before, src, after]
-        let mut parts: Vec<Tensor> = Vec::new();
+        let mut starts = vec![0i32; ndim];
+        let mut stops: Vec<i32> = shape.clone();
+        let strides = vec![1i32; ndim];
+        starts[dim] = start as i32;
+        stops[dim] = end as i32;
 
-        if start > 0 {
-            parts.push(self.narrow(dim as i64, 0, start));
-        }
-        parts.push(src.clone());
-        let after_start = end;
-        if after_start < dim_size {
-            parts.push(self.narrow(dim as i64, after_start, dim_size - after_start));
-        }
-
-        if parts.len() == 1 {
-            return parts.into_iter().next().unwrap();
-        }
-
-        Tensor::cat(&parts, dim as i64)
+        Tensor::from_mlx(crate::backend::mlx::ops::slice_update(
+            &self.inner,
+            &src.inner,
+            &starts,
+            &stops,
+            &strides,
+        ))
     }
 
     /// In-place fill (MLX: returns new tensor with fill value).
