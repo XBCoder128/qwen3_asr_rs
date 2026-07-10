@@ -4,6 +4,12 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct AsrConfig {
     pub thinker_config: ThinkerConfig,
+    /// ForcedAligner: token id for `<timestamp>` (default 151705).
+    #[serde(default = "default_timestamp_token_id")]
+    pub timestamp_token_id: i64,
+    /// ForcedAligner: milliseconds per timestamp class (default 80).
+    #[serde(default = "default_timestamp_segment_time")]
+    pub timestamp_segment_time: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -16,6 +22,18 @@ pub struct ThinkerConfig {
     pub audio_end_token_id: i64,
     #[serde(default = "default_audio_token_id")]
     pub audio_token_id: i64,
+    /// ForcedAligner classifier output size (lm_head rows). Absent for ASR.
+    #[serde(default)]
+    pub classify_num: Option<i64>,
+    #[serde(default)]
+    pub model_type: Option<String>,
+}
+
+fn default_timestamp_token_id() -> i64 {
+    151705
+}
+fn default_timestamp_segment_time() -> f64 {
+    80.0
 }
 
 fn default_audio_start_token_id() -> i64 { 151669 }

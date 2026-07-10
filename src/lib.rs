@@ -9,6 +9,7 @@ pub mod tensor;
 #[cfg(feature = "mlx")]
 pub mod backend;
 
+pub mod align;
 pub mod audio;
 pub mod audio_encoder;
 pub mod config;

@@ -541,6 +541,14 @@ impl Tensor {
         flat.to_kind(tch::Kind::Float).copy_data(&mut result, numel);
         result
     }
+
+    pub fn to_vec_i64(&self) -> Vec<i64> {
+        let flat = self.inner.view(-1);
+        let numel = flat.numel();
+        let mut result = vec![0i64; numel];
+        flat.to_kind(tch::Kind::Int64).copy_data(&mut result, numel);
+        result
+    }
 }
 
 // ===== MLX backend implementation =====
@@ -1050,6 +1058,11 @@ impl Tensor {
     pub fn to_vec_f32(&self) -> Vec<f32> {
         let f32_arr = self.inner.astype(crate::backend::mlx::ffi::mlx_dtype::MLX_FLOAT32);
         f32_arr.to_vec_f32()
+    }
+
+    pub fn to_vec_i64(&self) -> Vec<i64> {
+        let i64_arr = self.inner.astype(crate::backend::mlx::ffi::mlx_dtype::MLX_INT64);
+        i64_arr.to_vec_i64()
     }
 }
 
