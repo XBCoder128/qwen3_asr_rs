@@ -129,8 +129,16 @@ impl AsrInference {
 
         // Step 6: Precompute MRoPE cos/sin for all positions (prefill + max decode)
         let text_config = &self.config.thinker_config.text_config;
-        let max_new_tokens: usize = 256; // ASR rarely exceeds 256 tokens
-                                         // Precompute enough positions for prefill + decode budget
+        // Dense Chinese speech can be ~4–8 tokens/sec. The old hard cap of 256
+        // truncated ~7‑minute files to ~1 minute of transcript.
+        let max_new_tokens: usize = ((duration_seconds * 8.0).ceil() as usize)
+            .max(256)
+            .min(8192);
+        tracing::info!(
+            "Offline decode budget: max_new_tokens={} (duration={:.1}s)",
+            max_new_tokens,
+            duration_seconds
+        );
         let max_total_positions = seq_len + max_new_tokens + 8;
         let all_positions: Vec<i64> = (0..max_total_positions as i64).collect();
         let all_pos_ids: [Vec<i64>; 3] =
@@ -328,6 +336,22 @@ const POST_AUDIO_TOKENS: &[i64] = &[
     198,    // \n
 ];
 
+/// Fail before MLX `narrow` + `apply_rope` broadcast errors when the
+/// precomputed cos/sin table is exhausted (long unsegmented sessions).
+fn ensure_rope_span(cos: &Tensor, start: i64, len: i64) -> Result<()> {
+    let cap = cos.size()[0];
+    if start < 0 || len < 0 || start + len > cap {
+        anyhow::bail!(
+            "RoPE position table exhausted: need positions [{}, {}) but only {} precomputed. \
+             Reset StreamingState (VAD / hard-cap segment) or increase max_positions.",
+            start,
+            start + len,
+            cap
+        );
+    }
+    Ok(())
+}
+
 /// State for incremental streaming ASR.
 pub struct StreamingState {
     /// KV cache from previous iteration (None on first call).
@@ -409,11 +433,12 @@ impl AsrInference {
         let pre_audio_ids: Vec<i64> =
             vec![151644, 8948, 198, 151645, 198, 151644, 872, 198, 151669];
 
-        // Pre-allocate cos/sin for generous position budget.
-        // Must be large enough for pre_audio(9) + max_audio_tokens +
-        // post_audio(6) + language_prefix + max_generated_text.
-        // For 120s audio: ~1560 audio tokens + 9 + 6 + ~500 text = ~2075.
-        let max_positions = 4096i64;
+        // Pre-allocate cos/sin for a single streaming *segment*.
+        // Long sessions must reset StreamingState via VAD / hard-cap
+        // (see asr-cli doc/design-streaming-asr-vad.md); do not treat this
+        // as an unbounded whole-session budget.
+        // ~90–120s segment: ~1560 audio tokens + prompt + rollback prefix + decode.
+        let max_positions = 8192i64;
         let positions: Vec<i64> = (0..max_positions).collect();
         let pos_ids: [Vec<i64>; 3] = [positions.clone(), positions.clone(), positions];
         let (cos, sin) = compute_mrope_cos_sin(
@@ -638,6 +663,7 @@ impl AsrInference {
             // regardless of subsequent audio.
             let next_input = Tensor::from_slice_i64(&[token]).to_device(state.device);
             let next_hidden = self.text_decoder.embed(&next_input).unsqueeze(0);
+            ensure_rope_span(&state.cos, current_pos, 1)?;
             let new_cos = state.cos.narrow(0, current_pos, 1);
             let new_sin = state.sin.narrow(0, current_pos, 1);
 
@@ -738,6 +764,7 @@ impl AsrInference {
         hidden_states.eval();
 
         // Cos/sin + mask for full prefill
+        ensure_rope_span(&state.cos, 0, seq_len as i64)?;
         let cos = state.cos.narrow(0, 0, seq_len as i64);
         let sin = state.sin.narrow(0, 0, seq_len as i64);
         let mask = create_causal_mask(seq_len as i64, 0, self.text_decoder.dtype(), state.device);
@@ -849,6 +876,7 @@ impl AsrInference {
         }
         let new_hidden = Tensor::cat(&parts, 1); // (1, total_new, dim)
 
+        ensure_rope_span(&state.cos, pos_start, total_new as i64)?;
         let cos = state.cos.narrow(0, pos_start, total_new as i64);
         let sin = state.sin.narrow(0, pos_start, total_new as i64);
         let mask = create_causal_mask(
@@ -1269,6 +1297,7 @@ impl AsrInference {
             POST_AUDIO_TOKENS.len() + state.language_prefix_ids.len() + prefix_ids.len();
 
         let post_pos_start = (PRE_AUDIO_TOKEN_COUNT + num_audio_tokens) as i64;
+        ensure_rope_span(&state.cos, post_pos_start, total_len as i64)?;
         let cos = state.cos.narrow(0, post_pos_start, total_len as i64);
         let sin = state.sin.narrow(0, post_pos_start, total_len as i64);
         let mask = create_causal_mask(
@@ -1427,26 +1456,46 @@ fn trim_repeated_tail(ids: &mut Vec<i64>) {
     }
 }
 
+/// Pull spoken text out of Qwen3-ASR decode strings.
+///
+/// Streaming / long audio can emit mid-string control markup, e.g.
+/// `… language English<asr_text>… assistant<asr_text>…`. Older parsers only
+/// handled a clean prefix, which leaked tags into `.text` and broke translate.
 fn parse_asr_output(raw: &str, language_forced: bool) -> (String, String) {
-    if language_forced {
-        let raw = raw.trim();
-        // Model outputs "<asr_text>实际文本", strip the tag.
-        let text = raw
-            .strip_prefix("<asr_text>")
-            .unwrap_or(raw)
-            .trim()
-            .to_string();
-        return ("forced".to_string(), text);
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return (
+            if language_forced {
+                "forced".to_string()
+            } else {
+                "unknown".to_string()
+            },
+            String::new(),
+        );
     }
 
-    let raw = raw.trim();
+    let lang = if language_forced {
+        "forced".to_string()
+    } else {
+        detect_language_label(raw).unwrap_or_else(|| "unknown".to_string())
+    };
+
+    if raw.contains("<asr_text>") {
+        let mut parts = Vec::new();
+        for part in raw.split("<asr_text>").skip(1) {
+            let cleaned = strip_asr_segment_controls(part);
+            if !cleaned.is_empty() {
+                parts.push(cleaned);
+            }
+        }
+        return (lang, parts.join(" "));
+    }
+
+    if language_forced {
+        return (lang, raw.to_string());
+    }
 
     if let Some(rest) = raw.strip_prefix("language ") {
-        if let Some(asr_pos) = rest.find("<asr_text>") {
-            let lang = rest[..asr_pos].trim().to_string();
-            let text = rest[asr_pos + "<asr_text>".len()..].trim().to_string();
-            return (lang, text);
-        }
         let mut lang_end = 0;
         for (i, c) in rest.char_indices() {
             if c.is_whitespace() || !c.is_alphabetic() {
@@ -1456,13 +1505,65 @@ fn parse_asr_output(raw: &str, language_forced: bool) -> (String, String) {
             lang_end = i + c.len_utf8();
         }
         if lang_end > 0 {
-            let lang = rest[..lang_end].to_string();
+            let detected = rest[..lang_end].to_string();
             let text = rest[lang_end..].trim().to_string();
-            return (lang, text);
+            return (detected, text);
         }
     }
 
-    ("unknown".to_string(), raw.to_string())
+    (lang, raw.to_string())
+}
+
+fn detect_language_label(raw: &str) -> Option<String> {
+    let idx = raw.find("language ")?;
+    let after = &raw[idx + "language ".len()..];
+    let lang: String = after.chars().take_while(|c| c.is_alphabetic()).collect();
+    if lang.is_empty() {
+        None
+    } else {
+        Some(lang)
+    }
+}
+
+/// Strip chat-template leftovers from one `<asr_text>` payload.
+fn strip_asr_segment_controls(part: &str) -> String {
+    let mut s = part.trim().to_string();
+
+    // Leading `assistant` (decoded chat role between segments).
+    loop {
+        let trimmed = s.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("assistant") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                s = rest.trim_start().to_string();
+                continue;
+            }
+        }
+        break;
+    }
+
+    // Trailing `language English` (or similar) with no further speech.
+    if let Some(idx) = s.rfind("language ") {
+        let after = s[idx + "language ".len()..].trim();
+        let only_lang_word = !after.is_empty()
+            && after.chars().all(|c| c.is_alphabetic())
+            && after.split_whitespace().count() == 1;
+        if only_lang_word || after.is_empty() {
+            s = s[..idx].trim_end().to_string();
+        }
+    }
+
+    // Trailing standalone `assistant`.
+    let trimmed = s.trim_end();
+    if let Some(rest) = trimmed.strip_suffix("assistant") {
+        let rest = rest.trim_end();
+        if rest.is_empty()
+            || rest.ends_with(['.', '!', '?', ',', ';', '。', '！', '？', '，', '；'])
+        {
+            s = rest.to_string();
+        }
+    }
+
+    s.trim().to_string()
 }
 
 fn capitalize_first(s: &str) -> String {
@@ -1470,5 +1571,50 @@ fn capitalize_first(s: &str) -> String {
     match chars.next() {
         None => String::new(),
         Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+#[cfg(test)]
+mod parse_asr_output_tests {
+    use super::{parse_asr_output, strip_asr_segment_controls};
+
+    #[test]
+    fn clean_prefix_language_tag() {
+        let (lang, text) = parse_asr_output(
+            "language English<asr_text>Hello world.",
+            false,
+        );
+        assert_eq!(lang, "English");
+        assert_eq!(text, "Hello world.");
+    }
+
+    #[test]
+    fn forced_language_strips_tag() {
+        let (lang, text) = parse_asr_output("<asr_text>你好", true);
+        assert_eq!(lang, "forced");
+        assert_eq!(text, "你好");
+    }
+
+    #[test]
+    fn mid_string_garbage_and_multi_segment() {
+        let raw = "不要啊! currently trying to broaden. language English<asr_text>\
+We are currently trying to broaden that program. Yes. assistant<asr_text>\
+Just vaguely in general, we feature the Apple II. language English";
+        let (lang, text) = parse_asr_output(raw, false);
+        assert_eq!(lang, "English");
+        assert!(text.contains("We are currently trying to broaden that program."));
+        assert!(text.contains("Just vaguely in general, we feature the Apple II."));
+        assert!(!text.contains("<asr_text>"));
+        assert!(!text.contains("language English"));
+        assert!(!text.contains("assistant"));
+        assert!(!text.contains("不要啊"));
+    }
+
+    #[test]
+    fn strip_trailing_assistant_after_punct() {
+        assert_eq!(
+            strip_asr_segment_controls("Hello there. assistant"),
+            "Hello there."
+        );
     }
 }
