@@ -1,6 +1,6 @@
+use crate::tensor::{DType, Device, Tensor};
 use anyhow::Result;
 use std::collections::HashMap;
-use crate::tensor::{DType, Device, Tensor};
 
 use crate::config::AudioEncoderConfig;
 use crate::layers::{AudioEncoderLayer, Conv2d, LayerNorm, Linear};
@@ -25,6 +25,12 @@ pub struct AudioEncoder {
     proj2: Linear,
 
     config: AudioEncoderConfig,
+
+    /// When true, each chunk uses independent attention (block-diagonal
+    /// mask with chunks_per_window=1). This makes encoder outputs stable
+    /// under audio growth, enabling incremental KV cache reuse.
+    /// Set via `set_chunk_local(true)` before streaming.
+    chunk_local: bool,
 }
 
 impl AudioEncoder {
@@ -54,12 +60,17 @@ impl AudioEncoder {
         let proj1 = Linear::load(weights, &format!("{}.proj1", prefix))?;
         let proj2 = Linear::load(weights, &format!("{}.proj2", prefix))?;
 
+        // Match the weight dtype (bf16 for MLX) so the whole encoder runs in
+        // that dtype without implicit up-casting of weights per forward.
+        let model_dtype = conv2d1.weight.kind();
+
         // Create sinusoidal positional embedding
         let positional_embedding = create_sinusoidal_embedding(
             config.max_source_positions,
             config.d_model as usize,
             device,
-        );
+        )
+        .to_dtype(model_dtype);
 
         Ok(Self {
             conv2d1,
@@ -72,11 +83,30 @@ impl AudioEncoder {
             proj1,
             proj2,
             config: config.clone(),
+            chunk_local: false,
         })
+    }
+
+    /// Enable or disable chunk-local attention.
+    ///
+    /// When enabled, each mel chunk is encoded with independent attention
+    /// (no cross-chunk attention). This makes encoder outputs stable when
+    /// audio grows incrementally, which is required for incremental KV cache
+    /// reuse in streaming mode.
+    pub fn set_chunk_local(&mut self, enabled: bool) {
+        self.chunk_local = enabled;
+    }
+
+    /// The dtype the encoder weights are stored in.
+    pub fn dtype(&self) -> DType {
+        self.conv2d1.weight.kind()
     }
 
     /// Encode mel spectrogram features into continuous audio embeddings.
     pub fn forward(&self, mel_features: &Tensor) -> Tensor {
+        // Cast the (f32) mel input to the model dtype up-front so every
+        // subsequent op stays in the weight dtype (no implicit promotion).
+        let mel_features = &mel_features.to_dtype(self.dtype());
         let num_frames = mel_features.size()[1] as usize;
 
         // Chunk size = n_window * 2
@@ -86,6 +116,15 @@ impl AudioEncoder {
         let num_full_chunks = num_frames / chunk_size;
         let tail_frames = num_frames % chunk_size;
         let num_chunks = num_full_chunks + if tail_frames > 0 { 1 } else { 0 };
+
+        tracing::debug!(
+            "[encoder] num_frames={} chunk_size={} num_full_chunks={} tail_frames={} num_chunks={}",
+            num_frames,
+            chunk_size,
+            num_full_chunks,
+            tail_frames,
+            num_chunks
+        );
 
         let device = mel_features.device();
 
@@ -108,14 +147,10 @@ impl AudioEncoder {
             let pad_frames = chunk_size - tail_frames;
             let pad = Tensor::zeros(
                 &[mel_features.size()[0], pad_frames as i64],
-                DType::Float32,
+                self.dtype(),
                 device,
             );
-            let padded_mel = Tensor::cat(
-                &[tail_mel, pad],
-                1,
-            )
-            .unsqueeze(0);
+            let padded_mel = Tensor::cat(&[tail_mel, pad], 1).unsqueeze(0);
             chunk_mels.push(padded_mel);
             chunk_valid_tokens.push(Self::feat_extract_output_length(tail_frames));
         }
@@ -130,7 +165,10 @@ impl AudioEncoder {
 
         // Reshape: (b, channels, freq, time) -> (b, time, channels*freq)
         let (b, c, f, t) = x.size4();
-        let reshaped = x.permute(&[0, 3, 1, 2]).contiguous().reshape(&[b, t, c * f]);
+        let reshaped = x
+            .permute(&[0, 3, 1, 2])
+            .contiguous()
+            .reshape(&[b, t, c * f]);
         let conv_out = self.conv_out.forward(&reshaped);
 
         // Add positional embedding
@@ -147,6 +185,12 @@ impl AudioEncoder {
         // Concatenate: (total_tokens, d_model)
         let hidden = Tensor::cat(&all_valid, 0);
         let total_tokens = hidden.size()[0];
+
+        tracing::debug!(
+            "[encoder] chunk_valid_tokens={:?} total_tokens={}",
+            chunk_valid_tokens,
+            total_tokens
+        );
 
         // Add batch dim for transformer: (1, total_tokens, d_model)
         let mut hidden = hidden.unsqueeze(0);
@@ -169,6 +213,10 @@ impl AudioEncoder {
     }
 
     /// Build a block-diagonal windowed attention mask.
+    ///
+    /// When `self.chunk_local` is true, each chunk is its own window
+    /// (chunks_per_window = 1). This makes encoder outputs stable under
+    /// audio growth, enabling incremental KV cache in the decoder.
     fn build_window_mask(
         &self,
         total_tokens: i64,
@@ -178,27 +226,46 @@ impl AudioEncoder {
         let chunk_size = self.config.n_window * 2;
         let chunks_per_window = self.config.n_window_infer / chunk_size;
 
+        if self.chunk_local {
+            // Each chunk is its own window — always build a block-diagonal mask.
+            return Some(self.build_block_diagonal_mask(
+                total_tokens,
+                chunk_token_counts,
+                1,
+                device,
+            ));
+        }
+
         if chunks_per_window == 0 || chunk_token_counts.len() <= chunks_per_window {
             return None;
         }
 
+        self.build_block_diagonal_mask(total_tokens, chunk_token_counts, chunks_per_window, device)
+            .into()
+    }
+
+    fn build_block_diagonal_mask(
+        &self,
+        total_tokens: i64,
+        chunk_token_counts: &[usize],
+        chunks_per_window: usize,
+        device: Device,
+    ) -> Tensor {
         let num_windows = (chunk_token_counts.len() + chunks_per_window - 1) / chunks_per_window;
 
-        // Build mask using where_cond: start with -inf, then zero out allowed blocks
-        // Create a boolean mask indicating allowed positions
         let mut allow_data = vec![false; (total_tokens * total_tokens) as usize];
 
         let mut token_offset: i64 = 0;
         for w in 0..num_windows {
             let chunk_start = w * chunks_per_window;
-            let chunk_end = std::cmp::min(chunk_start + chunks_per_window, chunk_token_counts.len());
+            let chunk_end =
+                std::cmp::min(chunk_start + chunks_per_window, chunk_token_counts.len());
 
             let window_tokens: i64 = chunk_token_counts[chunk_start..chunk_end]
                 .iter()
                 .map(|&c| c as i64)
                 .sum();
 
-            // Mark this window block as allowed
             for r in token_offset..token_offset + window_tokens {
                 for c in token_offset..token_offset + window_tokens {
                     allow_data[(r * total_tokens + c) as usize] = true;
@@ -208,18 +275,16 @@ impl AudioEncoder {
             token_offset += window_tokens;
         }
 
-        // Build the mask tensor
+        // Build the mask tensor (in the model dtype to avoid promoting the
+        // fused SDPA inputs).
+        let mask_dtype = self.dtype();
         let neg_inf = Tensor::full(
             &[1, 1, total_tokens, total_tokens],
             f64::NEG_INFINITY,
-            DType::Float32,
+            mask_dtype,
             device,
         );
-        let zero = Tensor::zeros(
-            &[1, 1, total_tokens, total_tokens],
-            DType::Float32,
-            device,
-        );
+        let zero = Tensor::zeros(&[1, 1, total_tokens, total_tokens], mask_dtype, device);
 
         // Create bool mask from data
         // For tch backend: use from_slice + reshape
@@ -228,7 +293,10 @@ impl AudioEncoder {
         {
             let allow_mask = Tensor::from_tch(
                 tch::Tensor::from_slice(
-                    &allow_data.iter().map(|&b| if b { 1i64 } else { 0i64 }).collect::<Vec<_>>()
+                    &allow_data
+                        .iter()
+                        .map(|&b| if b { 1i64 } else { 0i64 })
+                        .collect::<Vec<_>>(),
                 )
                 .reshape([1, 1, total_tokens, total_tokens])
                 .to_kind(tch::Kind::Bool)
@@ -236,9 +304,10 @@ impl AudioEncoder {
             );
             // where(allow, 0, -inf)
             let mask = Tensor::from_tch(
-                zero.into_tch().where_self(&allow_mask.as_tch(), &neg_inf.into_tch())
+                zero.into_tch()
+                    .where_self(&allow_mask.as_tch(), &neg_inf.into_tch()),
             );
-            Some(mask)
+            mask
         }
 
         #[cfg(feature = "mlx")]
@@ -255,7 +324,7 @@ impl AudioEncoder {
                 &zero.inner,
                 &neg_inf.inner,
             ));
-            Some(mask)
+            mask
         }
     }
 
@@ -276,6 +345,16 @@ impl AudioEncoder {
             total += Self::feat_extract_output_length(tail_frames);
         }
         total
+    }
+
+    /// Chunk size in mel frames (= n_window * 2).
+    pub fn chunk_size(&self) -> usize {
+        self.config.n_window * 2
+    }
+
+    /// Tokens produced per full chunk.
+    pub fn tokens_per_chunk(&self) -> usize {
+        Self::feat_extract_output_length(self.config.n_window * 2)
     }
 }
 

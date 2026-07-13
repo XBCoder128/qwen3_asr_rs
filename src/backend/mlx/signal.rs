@@ -77,6 +77,11 @@ pub fn constant_pad_nd(x: &MlxArray, pad_widths: &[i32], val: f32) -> MlxArray {
 /// Short-Time Fourier Transform magnitude.
 ///
 /// Returns shape (n_frames, n_fft/2+1) as float32 abs values.
+///
+/// All frames are gathered into a single (n_frames, n_fft) matrix and
+/// transformed with one batched rFFT, instead of building one slice +
+/// rfft + abs node per frame (which made the lazy graph grow linearly
+/// with audio length).
 pub fn stft_magnitude(
     signal: &MlxArray,
     n_fft: i32,
@@ -86,21 +91,17 @@ pub fn stft_magnitude(
     let padded_len = signal.shape()[0];
     let n_frames = (padded_len - n_fft) / hop_length + 1;
 
-    let mut frame_arrays = Vec::with_capacity(n_frames as usize);
+    let mut idx = Vec::with_capacity((n_frames * n_fft) as usize);
     for i in 0..n_frames {
         let start = i * hop_length;
-        let starts = vec![start];
-        let stops = vec![start + n_fft];
-        let strides = vec![1i32];
-        let frame = ops::slice(signal, &starts, &stops, &strides);
-
-        let windowed = ops::multiply(&frame, window);
-        let spectrum = ops::rfft(&windowed, n_fft, -1);
-        let magnitude = ops::abs(&spectrum);
-
-        frame_arrays.push(magnitude);
+        for j in 0..n_fft {
+            idx.push(start + j);
+        }
     }
+    let idx = MlxArray::from_i32(&idx, &[n_frames, n_fft]);
 
-    let refs: Vec<&MlxArray> = frame_arrays.iter().collect();
-    ops::stack(&refs, 0)
+    let frames = ops::take(signal, &idx, 0); // (n_frames, n_fft)
+    let windowed = ops::multiply(&frames, window); // window broadcasts over frames
+    let spectrum = ops::rfft(&windowed, n_fft, -1);
+    ops::abs(&spectrum)
 }

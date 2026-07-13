@@ -127,6 +127,32 @@ pub fn squeeze(a: &MlxArray, axes: &[i32]) -> MlxArray {
     res
 }
 
+/// Functional slice assignment: returns `src` with `src[start:stop] = update`.
+/// When the source buffer has no other references at eval time, MLX donates
+/// the buffer and performs the update in place (no copy) — this is the
+/// backbone of the preallocated KV cache.
+pub fn slice_update(
+    src: &MlxArray,
+    update: &MlxArray,
+    start: &[i32],
+    stop: &[i32],
+    strides: &[i32],
+) -> MlxArray {
+    let mut res = MlxArray::empty();
+    unsafe {
+        ffi::mlx_slice_update(
+            &mut res.ptr,
+            src.ptr,
+            update.ptr,
+            start.as_ptr(), start.len(),
+            stop.as_ptr(), stop.len(),
+            strides.as_ptr(), strides.len(),
+            default_stream(),
+        );
+    }
+    res
+}
+
 pub fn slice(a: &MlxArray, start: &[i32], stop: &[i32], strides: &[i32]) -> MlxArray {
     let mut res = MlxArray::empty();
     unsafe {
@@ -332,7 +358,9 @@ pub fn silu(a: &MlxArray) -> MlxArray {
 }
 
 pub fn gelu(a: &MlxArray) -> MlxArray {
-    let coeff = MlxArray::scalar_f32(1.702);
+    // Cast the coefficient to the input dtype: a strongly-typed f32 scalar
+    // would promote bf16 activations (and thus the whole graph) to f32.
+    let coeff = MlxArray::scalar_f32(1.702).astype(a.dtype());
     let scaled = multiply(a, &coeff);
     let sig = sigmoid(&scaled);
     multiply(a, &sig)
@@ -551,12 +579,30 @@ pub fn fast_sdpa(
 }
 
 // ---------------------------------------------------------------------------
+// Evaluation
+// ---------------------------------------------------------------------------
+
+/// Asynchronously evaluate arrays: queues the GPU work for the full
+/// dependency graph and returns immediately without waiting.
+pub fn async_eval(arrays: &[&MlxArray]) {
+    unsafe {
+        let vec = ffi::mlx_vector_array_new();
+        for a in arrays {
+            ffi::mlx_vector_array_append_value(vec, a.ptr);
+        }
+        ffi::mlx_async_eval(vec);
+        ffi::mlx_vector_array_free(vec);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FFT
 // ---------------------------------------------------------------------------
 
 pub fn rfft(a: &MlxArray, n: i32, axis: i32) -> MlxArray {
     let mut res = MlxArray::empty();
-    unsafe { ffi::mlx_fft_rfft(&mut res.ptr, a.ptr, n, axis, default_stream()) };
+    // MLX_FFT_NORM_BACKWARD = 0 (no normalization, matches torch.stft default)
+    unsafe { ffi::mlx_fft_rfft(&mut res.ptr, a.ptr, n, axis, 0, default_stream()) };
     res
 }
 

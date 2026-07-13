@@ -521,6 +521,9 @@ impl Tensor {
     /// Evaluate tensor (no-op for tch which uses eager execution).
     pub fn eval(&self) {}
 
+    /// Asynchronously evaluate tensors (no-op for tch which is eager).
+    pub fn async_eval(_tensors: &[&Tensor]) {}
+
     // -- Data extraction --
 
     pub fn int64_value(&self, indices: &[i64]) -> i64 {
@@ -536,6 +539,14 @@ impl Tensor {
         let numel = flat.numel();
         let mut result = vec![0.0f32; numel];
         flat.to_kind(tch::Kind::Float).copy_data(&mut result, numel);
+        result
+    }
+
+    pub fn to_vec_i64(&self) -> Vec<i64> {
+        let flat = self.inner.view(-1);
+        let numel = flat.numel();
+        let mut result = vec![0i64; numel];
+        flat.to_kind(tch::Kind::Int64).copy_data(&mut result, numel);
         result
     }
 }
@@ -828,29 +839,26 @@ impl Tensor {
     }
 
     /// Replaces self[..., start:end:step, ...] along dim with src.
+    /// Uses the native slice_update kernel: when `self` holds the only
+    /// reference to its buffer at eval time, MLX updates it in place.
     pub fn slice_scatter(&self, src: &Tensor, dim: i64, start: i64, end: i64, _step: i64) -> Self {
         let ndim = self.inner.ndim() as usize;
         let dim = if dim < 0 { ndim as i64 + dim } else { dim } as usize;
         let shape = self.inner.shape();
-        let dim_size = shape[dim] as i64;
 
-        // Build: [before, src, after]
-        let mut parts: Vec<Tensor> = Vec::new();
+        let mut starts = vec![0i32; ndim];
+        let mut stops: Vec<i32> = shape.clone();
+        let strides = vec![1i32; ndim];
+        starts[dim] = start as i32;
+        stops[dim] = end as i32;
 
-        if start > 0 {
-            parts.push(self.narrow(dim as i64, 0, start));
-        }
-        parts.push(src.clone());
-        let after_start = end;
-        if after_start < dim_size {
-            parts.push(self.narrow(dim as i64, after_start, dim_size - after_start));
-        }
-
-        if parts.len() == 1 {
-            return parts.into_iter().next().unwrap();
-        }
-
-        Tensor::cat(&parts, dim as i64)
+        Tensor::from_mlx(crate::backend::mlx::ops::slice_update(
+            &self.inner,
+            &src.inner,
+            &starts,
+            &stops,
+            &strides,
+        ))
     }
 
     /// In-place fill (MLX: returns new tensor with fill value).
@@ -1015,6 +1023,14 @@ impl Tensor {
         self.inner.eval();
     }
 
+    /// Queue GPU evaluation of the given tensors without blocking.
+    /// Lets the CPU build the next step's graph while the GPU works.
+    pub fn async_eval(tensors: &[&Tensor]) {
+        let refs: Vec<&crate::backend::mlx::array::MlxArray> =
+            tensors.iter().map(|t| &t.inner).collect();
+        crate::backend::mlx::ops::async_eval(&refs);
+    }
+
     // -- Data extraction --
 
     pub fn int64_value(&self, indices: &[i64]) -> i64 {
@@ -1042,6 +1058,11 @@ impl Tensor {
     pub fn to_vec_f32(&self) -> Vec<f32> {
         let f32_arr = self.inner.astype(crate::backend::mlx::ffi::mlx_dtype::MLX_FLOAT32);
         f32_arr.to_vec_f32()
+    }
+
+    pub fn to_vec_i64(&self) -> Vec<i64> {
+        let i64_arr = self.inner.astype(crate::backend::mlx::ffi::mlx_dtype::MLX_INT64);
+        i64_arr.to_vec_i64()
     }
 }
 

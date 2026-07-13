@@ -188,17 +188,67 @@ Test audio files:
 
 ## Performance Notes
 
-Benchmarked on Apple Silicon (MLX, 0.6B model, sample1.wav → 31 tokens):
-- First run includes Metal shader compilation (~3.0s)
-- Warm runs: ~2.3s
-- Decode loop is the bottleneck (28 layers × 31 steps × 7+ matmuls per layer)
+Benchmarked on Apple M4 (MLX, 0.6B model):
+- Offline sample5.wav (73s audio): ~6.5s total (~11x realtime)
+- Streaming (1s chunks, rollback=5): ~0.28–0.40s per chunk end-to-end,
+  stable up to 73s audio (no per-chunk latency growth)
+
+### BF16 inference (CRITICAL)
+Weights are stored BF16 on disk and are kept BF16 at load time. ALL
+activations, RoPE cos/sin tables, attention masks, and mel input must be
+cast to the model dtype (`text_decoder.dtype()` / `audio_encoder.dtype()`).
+Any strongly-typed f32 array entering the graph (f32 cos/sin, f32 mask,
+f32 scalar created via `MlxArray::scalar_f32`) promotes the whole graph to
+f32, which inserts an implicit `astype` of EVERY weight on EVERY forward
+pass — this was a ~4x decode slowdown. `ops::gelu` casts its 1.702
+coefficient to the input dtype for this reason; follow the same pattern
+for any new scalar constants.
+
+### Preallocated KV cache (applied)
+`KvCache` follows mlx-lm's KVCache pattern: per-layer buffers preallocated
+in blocks of 256 positions; new K/V entries are written via
+`mlx_slice_update` (exposed as `Tensor::slice_scatter`), which MLX performs
+in place when the buffer has no other references at eval time (donation).
+Attention reads a `narrow(2, 0, offset)` view. This removes the
+O(cache_len) `cat([past, new])` copy per layer per decode step.
+`truncate()` is O(1) — it only rewinds the offset; stale entries past it
+are overwritten by the next prefill. Do NOT hold long-lived references to
+the internal buffers: that would defeat buffer donation and force copies.
+
+### Streaming-specific optimizations (applied)
+- **Incremental mel/STFT cache** (`MelCache` in `mel.rs`): only new frames
+  are STFT'd per call; the global log-mel normalization is re-applied to the
+  full cached spectrogram (cheap). STFT itself is batched: one gather +
+  one batched rFFT instead of per-frame slice/rfft graph nodes.
+- **Decode loop reads the token on CPU before embedding it** (do NOT feed
+  the GPU argmax tensor straight into `embed`/take under lazy eval — it can
+  read stale rows and lock decoding onto one token).
+- **No per-call `clear_cache()`**: MLX buffer cache is only cleared when it
+  exceeds 3 GB. Clearing every call forced Metal buffer re-allocation and
+  was a large per-call cost.
+- Prefill builds hidden states via `cat([pre, audio, post, ...])` (audio
+  positions are contiguous) — no per-token `slice_scatter`/`get` loops.
+
+### Streaming anti-hallucination guards (applied)
+The rollback prefix is the #1 source of stuck/hallucinated output — errors
+frozen into the prefix condition all future decoding:
+- **Prefix via decode→re-encode** (`streaming_rollback_prefix_ids`), never
+  raw token-ID slicing: hard-slicing breaks BPE boundaries on multilingual
+  text (U+FFFD in prefix poisons the KV cache → decoder locks onto one
+  token like `!` regardless of audio).
+- **`unfixed_chunk_num` (default 2)**: no prefix for the first N calls —
+  hypotheses from <2 chunks of audio are unreliable and must not be frozen.
+- **`max_new_tokens` per streaming call (default 32)**: caps how far a
+  derailed decode can hallucinate (official streaming examples use 32).
+- **Runaway repeat guards**: short-cycle detection stops decode early
+  (period ≤4, threshold 6 in streaming), `trim_repeated_tail` loops until
+  no whole-phrase repeat remains, and `sanitize_for_rollback` cleans the
+  IDs before they become the next call's prefix.
+- Small `rollback_tokens` values (1–2) freeze errors quickly and cause
+  visible wording drift vs offline; prefer 3–7.
 
 ## Future Optimization Opportunities
 
 1. **Fused RoPE integration**: Use `mlx_fast_rope` with offset parameter instead of precomputed cos/sin tensors. Since all 3 MRoPE dims are identical, this would work with a single offset. Requires changing the attention layer interface.
 
-2. **Pre-allocated KV cache**: Currently each decode step allocates new tensors via `Tensor::cat([past, new])`. Pre-allocating max-size buffers and writing into them would eliminate repeated allocation/copy.
-
-3. **Conv2d weight pre-transpose**: Store weights in MLX NHWC format at load time to avoid per-forward transpose (minor, audio encoder only).
-
-4. **BFloat16 inference**: Run the model in BF16 instead of F32 to halve memory bandwidth (currently all weights converted to F32 at load time).
+2. **Conv2d weight pre-transpose**: Store weights in MLX NHWC format at load time to avoid per-forward transpose (minor, audio encoder only).
