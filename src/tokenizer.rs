@@ -57,3 +57,5 @@ pub const AUDIO_START_TOKEN_ID: i64 = 151669;
 pub const AUDIO_END_TOKEN_ID: i64 = 151670;
 pub const AUDIO_PAD_TOKEN_ID: i64 = 151676;
 pub const ASR_TEXT_TOKEN_ID: i64 = 151704;
+/// ForcedAligner `<timestamp>` token.
+pub const TIMESTAMP_TOKEN_ID: i64 = 151705;
