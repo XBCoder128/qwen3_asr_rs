@@ -336,18 +336,59 @@ const POST_AUDIO_TOKENS: &[i64] = &[
     198,    // \n
 ];
 
-/// Fail before MLX `narrow` + `apply_rope` broadcast errors when the
-/// precomputed cos/sin table is exhausted (long unsegmented sessions).
-fn ensure_rope_span(cos: &Tensor, start: i64, len: i64) -> Result<()> {
-    let cap = cos.size()[0];
-    if start < 0 || len < 0 || start + len > cap {
+/// Soft cap for on-demand RoPE growth within one segment.
+/// Beyond this, caller must reset StreamingState (VAD / hard-cap).
+const ROPE_SOFT_CAP: i64 = 16_384;
+
+/// Ensure `state.cos/sin` cover `[start, start+len)`. Grows tables on demand
+/// up to [`ROPE_SOFT_CAP`]; fails past that so long sessions still segment.
+fn ensure_rope_span(
+    inf: &AsrInference,
+    state: &mut StreamingState,
+    start: i64,
+    len: i64,
+) -> Result<()> {
+    if start < 0 || len < 0 {
+        anyhow::bail!("RoPE span invalid: start={start} len={len}");
+    }
+    let need = start + len;
+    let mut cap = state.cos.size()[0];
+    if need <= cap {
+        return Ok(());
+    }
+    if need > ROPE_SOFT_CAP {
         anyhow::bail!(
-            "RoPE position table exhausted: need positions [{}, {}) but only {} precomputed. \
-             Reset StreamingState (VAD / hard-cap segment) or increase max_positions.",
+            "RoPE position table exhausted: need positions [{}, {}) but soft cap is {}. \
+             Reset StreamingState (VAD / hard-cap segment) or increase ROPE_SOFT_CAP.",
             start,
-            start + len,
-            cap
+            need,
+            ROPE_SOFT_CAP
         );
+    }
+    let text_config = &inf.config.thinker_config.text_config;
+    let model_dtype = inf.text_decoder.dtype();
+    // Grow in 1024-row chunks to amortize cat cost.
+    let mut new_cap = ((need + 1023) / 1024) * 1024;
+    new_cap = new_cap.min(ROPE_SOFT_CAP);
+    while cap < new_cap {
+        let chunk_end = (cap + 1024).min(new_cap);
+        let positions: Vec<i64> = (cap..chunk_end).collect();
+        let pos_ids: [Vec<i64>; 3] = [positions.clone(), positions.clone(), positions];
+        let (extra_cos, extra_sin) = compute_mrope_cos_sin(
+            &pos_ids,
+            text_config.head_dim,
+            text_config.rope_theta,
+            &text_config.mrope_section(),
+            text_config.mrope_interleaved(),
+            state.device,
+        );
+        let extra_cos = extra_cos.to_dtype(model_dtype);
+        let extra_sin = extra_sin.to_dtype(model_dtype);
+        state.cos = Tensor::cat(&[state.cos.clone(), extra_cos], 0);
+        state.sin = Tensor::cat(&[state.sin.clone(), extra_sin], 0);
+        state.cos.eval();
+        state.sin.eval();
+        cap = state.cos.size()[0];
     }
     Ok(())
 }
@@ -382,7 +423,7 @@ pub struct StreamingState {
     /// N = only re-decode the last N tokens, prefix the rest.
     rollback_tokens: usize,
     /// Decode-call counter (increments once per processed streaming call).
-    chunk_id: usize,
+    pub chunk_id: usize,
     /// For the first N processed calls, do NOT use the previous output as
     /// prefix (matches official `unfixed_chunk_num`, default 2). Early
     /// hypotheses on very little audio are unreliable; freezing them as a
@@ -397,6 +438,10 @@ pub struct StreamingState {
     /// Token IDs for the language prefix (e.g. "language English").
     /// Computed once in init_streaming, reused in every prefill.
     language_prefix_ids: Vec<i64>,
+    /// Cross-segment context: last N tokens of previously *committed*
+    /// transcript. Prefilled after language, never included in
+    /// `last_generated_ids` / segment output (segment-local text only).
+    context_prefix_ids: Vec<i64>,
     /// Device for tensor creation.
     device: Device,
 }
@@ -415,6 +460,22 @@ impl AsrInference {
         language: Option<&str>,
         rollback_tokens: usize,
     ) -> Result<StreamingState> {
+        self.init_streaming_with_context(language, rollback_tokens, None, 64)
+    }
+
+    /// Like [`init_streaming`], but seeds a capped cross-segment text prefix
+    /// from previously committed transcript (VAD segment boundary).
+    ///
+    /// `context_text` is tokenized and truncated to the **last**
+    /// `max_context_tokens` (0 disables). Prefill order:
+    /// `post_audio → language? → context? → rollback_prefix?`.
+    pub fn init_streaming_with_context(
+        &mut self,
+        language: Option<&str>,
+        rollback_tokens: usize,
+        context_text: Option<&str>,
+        max_context_tokens: usize,
+    ) -> Result<StreamingState> {
         // Enable chunk-local attention for stable incremental encoding.
         self.audio_encoder.set_chunk_local(true);
         let text_config = &self.config.thinker_config.text_config;
@@ -427,6 +488,17 @@ impl AsrInference {
             (Some(lang.to_string()), ids)
         } else {
             (None, Vec::new())
+        };
+
+        let context_prefix_ids = match (context_text, max_context_tokens) {
+            (Some(text), n) if n > 0 && !text.trim().is_empty() => {
+                let mut ids = self.tokenizer.encode(text.trim())?;
+                if ids.len() > n {
+                    ids = ids.split_off(ids.len() - n);
+                }
+                ids
+            }
+            _ => Vec::new(),
         };
 
         // Pre-audio token IDs (constant).
@@ -461,6 +533,13 @@ impl AsrInference {
         let pre_audio_embeds = self.text_decoder.embed(&pre_tensor).unsqueeze(0);
         pre_audio_embeds.eval();
 
+        if !context_prefix_ids.is_empty() {
+            tracing::info!(
+                "[streaming] context_prefix_tokens={}",
+                context_prefix_ids.len()
+            );
+        }
+
         Ok(StreamingState {
             kv_cache: None,
             audio_tokens_in_cache: 0,
@@ -478,6 +557,7 @@ impl AsrInference {
             max_new_tokens: 32,
             forced_language,
             language_prefix_ids,
+            context_prefix_ids,
             device: self.device,
         })
     }
@@ -627,7 +707,11 @@ impl AsrInference {
         // NEW tokens for this call's fresh audio (the prefix is prefilled),
         // so a small budget is enough — and it caps how far a derailed
         // decode can hallucinate.
-        let kv_cache = state.kv_cache.as_mut().unwrap();
+        // Take KV out so ensure_rope_span can mutably grow cos/sin mid-decode.
+        let mut kv_cache = state
+            .kv_cache
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("streaming decode missing kv_cache"))?;
         let seq_len = state.cache_seq_len;
         let max_new_tokens: usize = state.max_new_tokens.max(state.rollback_tokens + 8);
         let eos_token_ids = vec![ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID];
@@ -642,39 +726,41 @@ impl AsrInference {
         let mut token_arr = first_logits.argmax(-1, false);
         token_arr.eval();
 
-        for _ in 0..max_new_tokens {
-            let token = token_arr.int64_value(&[0]);
-            if eos_token_ids.contains(&token) {
-                break;
-            }
-            generated_ids.push(token);
-            if let Some(period) = detect_tail_repetition(&generated_ids) {
-                collapse_tail_repetition(&mut generated_ids, period);
-                tracing::warn!(
-                    "[streaming] runaway decode stopped (period={}) — KV prefix will not carry repeats",
-                    period
-                );
-                break;
-            }
+        let decode_result = (|| -> Result<()> {
+            for _ in 0..max_new_tokens {
+                let token = token_arr.int64_value(&[0]);
+                if eos_token_ids.contains(&token) {
+                    break;
+                }
+                generated_ids.push(token);
+                if let Some(period) = detect_tail_repetition(&generated_ids) {
+                    collapse_tail_repetition(&mut generated_ids, period);
+                    tracing::warn!(
+                        "[streaming] runaway decode stopped (period={}) — KV prefix will not carry repeats",
+                        period
+                    );
+                    break;
+                }
 
-            // Embed from a fresh CPU int64 scalar — feeding the GPU argmax
-            // tensor directly into take() can produce stale/wrong rows under
-            // lazy eval, which manifests as a single token (e.g. '!') stuck
-            // regardless of subsequent audio.
-            let next_input = Tensor::from_slice_i64(&[token]).to_device(state.device);
-            let next_hidden = self.text_decoder.embed(&next_input).unsqueeze(0);
-            ensure_rope_span(&state.cos, current_pos, 1)?;
-            let new_cos = state.cos.narrow(0, current_pos, 1);
-            let new_sin = state.sin.narrow(0, current_pos, 1);
+                let next_input = Tensor::from_slice_i64(&[token]).to_device(state.device);
+                let next_hidden = self.text_decoder.embed(&next_input).unsqueeze(0);
+                ensure_rope_span(self, state, current_pos, 1)?;
+                let new_cos = state.cos.narrow(0, current_pos, 1);
+                let new_sin = state.sin.narrow(0, current_pos, 1);
 
-            let next_logits = self
-                .text_decoder
-                .forward(&next_hidden, &new_cos, &new_sin, kv_cache, None)
-                .squeeze_dim(1);
-            token_arr = next_logits.argmax(-1, false);
-            token_arr.eval();
-            current_pos += 1;
-        }
+                let next_logits = self
+                    .text_decoder
+                    .forward(&next_hidden, &new_cos, &new_sin, &mut kv_cache, None)
+                    .squeeze_dim(1);
+                token_arr = next_logits.argmax(-1, false);
+                token_arr.eval();
+                current_pos += 1;
+            }
+            Ok(())
+        })();
+
+        state.kv_cache = Some(kv_cache);
+        decode_result?;
 
         // Post-decode cleanup before the result feeds the next rollback prefix.
         trim_repeated_tail(&mut generated_ids);
@@ -738,7 +824,8 @@ impl AsrInference {
         let seq_len = PRE_AUDIO_TOKEN_COUNT
             + num_audio_tokens
             + POST_AUDIO_TOKENS.len()
-            + state.language_prefix_ids.len();
+            + state.language_prefix_ids.len()
+            + state.context_prefix_ids.len();
 
         // Build hidden states: pre_audio + audio + post_audio + language_prefix.
         // pre_audio_embeds covers positions 0..PRE_AUDIO_TOKEN_COUNT and the
@@ -761,10 +848,17 @@ impl AsrInference {
             let lang_embeds = self.text_decoder.embed(&lang_tensor).unsqueeze(0);
             hidden_states = Tensor::cat(&[hidden_states, lang_embeds], 1);
         }
+        // Cross-segment committed context (not part of this segment's output).
+        if !state.context_prefix_ids.is_empty() {
+            let ctx_tensor =
+                Tensor::from_slice_i64(&state.context_prefix_ids).to_device(state.device);
+            let ctx_embeds = self.text_decoder.embed(&ctx_tensor).unsqueeze(0);
+            hidden_states = Tensor::cat(&[hidden_states, ctx_embeds], 1);
+        }
         hidden_states.eval();
 
         // Cos/sin + mask for full prefill
-        ensure_rope_span(&state.cos, 0, seq_len as i64)?;
+        ensure_rope_span(self, state, 0, seq_len as i64)?;
         let cos = state.cos.narrow(0, 0, seq_len as i64);
         let sin = state.sin.narrow(0, 0, seq_len as i64);
         let mask = create_causal_mask(seq_len as i64, 0, self.text_decoder.dtype(), state.device);
@@ -840,21 +934,25 @@ impl AsrInference {
         // Compute prefix via decode→re-encode (UTF-8 safe), NOT raw token slice.
         let prefix_ids = self.streaming_rollback_prefix_ids(state)?;
 
-        let total_new =
-            num_new + POST_AUDIO_TOKENS.len() + state.language_prefix_ids.len() + prefix_ids.len();
+        let total_new = num_new
+            + POST_AUDIO_TOKENS.len()
+            + state.language_prefix_ids.len()
+            + state.context_prefix_ids.len()
+            + prefix_ids.len();
 
         tracing::debug!(
-            "[streaming-inc] truncate_len={} num_new={} pos_start={} total_new={} prefix={} lang={}",
+            "[streaming-inc] truncate_len={} num_new={} pos_start={} total_new={} prefix={} lang={} ctx={}",
             truncate_len,
             num_new,
             pos_start,
             total_new,
             prefix_ids.len(),
-            state.language_prefix_ids.len()
+            state.language_prefix_ids.len(),
+            state.context_prefix_ids.len()
         );
 
-        // Build hidden states: new audio embeds + post-audio embeds + language prefix + rollback prefix text embeds
-        let mut parts: Vec<Tensor> = Vec::with_capacity(4);
+        // Build hidden states: new audio + post + language + context + rollback
+        let mut parts: Vec<Tensor> = Vec::with_capacity(5);
         parts.push(
             audio_embeds
                 .narrow(0, old_audio as i64, num_new as i64)
@@ -869,6 +967,12 @@ impl AsrInference {
             let lang_embeds = self.text_decoder.embed(&lang_tensor).unsqueeze(0);
             parts.push(lang_embeds);
         }
+        if !state.context_prefix_ids.is_empty() {
+            let ctx_tensor =
+                Tensor::from_slice_i64(&state.context_prefix_ids).to_device(state.device);
+            let ctx_embeds = self.text_decoder.embed(&ctx_tensor).unsqueeze(0);
+            parts.push(ctx_embeds);
+        }
         if !prefix_ids.is_empty() {
             let prefix_tensor = Tensor::from_slice_i64(&prefix_ids).to_device(state.device);
             let prefix_embeds = self.text_decoder.embed(&prefix_tensor).unsqueeze(0);
@@ -876,7 +980,7 @@ impl AsrInference {
         }
         let new_hidden = Tensor::cat(&parts, 1); // (1, total_new, dim)
 
-        ensure_rope_span(&state.cos, pos_start, total_new as i64)?;
+        ensure_rope_span(self, state, pos_start, total_new as i64)?;
         let cos = state.cos.narrow(0, pos_start, total_new as i64);
         let sin = state.sin.narrow(0, pos_start, total_new as i64);
         let mask = create_causal_mask(
@@ -1272,7 +1376,7 @@ impl AsrInference {
         state: &mut StreamingState,
         num_audio_tokens: usize,
     ) -> Result<Tensor> {
-        // Build hidden: post_audio + language_prefix + rollback prefix text.
+        // Build hidden: post_audio + language + context + rollback prefix text.
         // The prefix MUST be prefilled here too: the decode loop assumes the
         // prefix is already in the KV cache whenever rollback is enabled.
         let post_tensor = Tensor::from_slice_i64(POST_AUDIO_TOKENS).to_device(state.device);
@@ -1284,6 +1388,12 @@ impl AsrInference {
             let lang_embeds = self.text_decoder.embed(&lang_tensor).unsqueeze(0);
             hidden_parts.push(lang_embeds);
         }
+        if !state.context_prefix_ids.is_empty() {
+            let ctx_tensor =
+                Tensor::from_slice_i64(&state.context_prefix_ids).to_device(state.device);
+            let ctx_embeds = self.text_decoder.embed(&ctx_tensor).unsqueeze(0);
+            hidden_parts.push(ctx_embeds);
+        }
 
         let prefix_ids = self.streaming_rollback_prefix_ids(state)?;
         if !prefix_ids.is_empty() {
@@ -1293,11 +1403,13 @@ impl AsrInference {
         }
 
         let post_hidden = Tensor::cat(&hidden_parts, 1);
-        let total_len =
-            POST_AUDIO_TOKENS.len() + state.language_prefix_ids.len() + prefix_ids.len();
+        let total_len = POST_AUDIO_TOKENS.len()
+            + state.language_prefix_ids.len()
+            + state.context_prefix_ids.len()
+            + prefix_ids.len();
 
         let post_pos_start = (PRE_AUDIO_TOKEN_COUNT + num_audio_tokens) as i64;
-        ensure_rope_span(&state.cos, post_pos_start, total_len as i64)?;
+        ensure_rope_span(self, state, post_pos_start, total_len as i64)?;
         let cos = state.cos.narrow(0, post_pos_start, total_len as i64);
         let sin = state.sin.narrow(0, post_pos_start, total_len as i64);
         let mask = create_causal_mask(

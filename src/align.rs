@@ -284,36 +284,78 @@ impl AlignInference {
 // ---------------------------------------------------------------------------
 
 fn is_kept_char(ch: char) -> bool {
-    if ch == '\'' {
+    if ch.is_alphabetic() || ch.is_numeric() {
         return true;
     }
-    match unicode_general_category(ch) {
-        Category::Letter | Category::Number => true,
-        _ => false,
-    }
-}
-
-#[derive(Copy, Clone)]
-enum Category {
-    Letter,
-    Number,
-    Other,
-}
-
-fn unicode_general_category(ch: char) -> Category {
-    // Avoid pulling in unicode-segmentation; approximate Letter/Number via
-    // Rust char predicates (covers the scripts ForcedAligner cares about).
-    if ch.is_alphabetic() {
-        Category::Letter
-    } else if ch.is_numeric() {
-        Category::Number
-    } else {
-        Category::Other
-    }
+    // Keep apostrophe / punctuation so aligned segments match ASR text.
+    // Whitespace still dropped via split_whitespace upstream.
+    matches!(
+        ch,
+        '\''
+            | '\u{2019}' // ’
+            | '\u{2018}' // ‘
+            | '.'
+            | ','
+            | '!'
+            | '?'
+            | ';'
+            | ':'
+            | '-'
+            | '"'
+            | '\u{201c}' // “
+            | '\u{201d}' // ”
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '…'
+            | '—'
+            | '–'
+            | '。'
+            | '，'
+            | '！'
+            | '？'
+            | '；'
+            | '：'
+            | '、'
+            | '（'
+            | '）'
+            | '【'
+            | '】'
+            | '《'
+            | '》'
+            | '「'
+            | '」'
+            | '『'
+            | '』'
+            | '·'
+            | '～'
+            | '~'
+            | '%'
+            | '/'
+            | '\\'
+            | '&'
+            | '+'
+            | '='
+            | '*'
+            | '#'
+            | '@'
+    )
 }
 
 fn clean_token(token: &str) -> String {
     token.chars().filter(|&c| is_kept_char(c)).collect()
+}
+
+/// Split CJK ideographs AND CJK/fullwidth punctuation into single units;
+/// keep Latin runs (incl. attached ASCII punct / apostrophes) together.
+fn is_cjk_unit_char(ch: char) -> bool {
+    is_cjk_char(ch)
+        || matches!(
+            ch,
+            '。' | '，' | '！' | '？' | '；' | '：' | '、' | '（' | '）' | '【' | '】'
+                | '《' | '》' | '「' | '」' | '『' | '』' | '·' | '…' | '—' | '～'
+        )
 }
 
 fn is_cjk_char(ch: char) -> bool {
@@ -331,7 +373,7 @@ fn split_segment_with_chinese(seg: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut buf = String::new();
     for ch in seg.chars() {
-        if is_cjk_char(ch) {
+        if is_cjk_unit_char(ch) {
             if !buf.is_empty() {
                 tokens.push(std::mem::take(&mut buf));
             }
@@ -485,12 +527,22 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_english_keeps_punct_and_apostrophe() {
+        let (words, _) =
+            encode_timestamp("It's day five, growing.", "English").unwrap();
+        assert_eq!(words, vec!["It's", "day", "five,", "growing."]);
+    }
+
+    #[test]
     fn tokenize_chinese() {
         let (words, _) =
             encode_timestamp("甚至出现交易几乎停滞的情况。", "Chinese").unwrap();
         assert_eq!(
             words,
-            vec!["甚", "至", "出", "现", "交", "易", "几", "乎", "停", "滞", "的", "情", "况"]
+            vec![
+                "甚", "至", "出", "现", "交", "易", "几", "乎", "停", "滞", "的", "情", "况",
+                "。"
+            ]
         );
     }
 
