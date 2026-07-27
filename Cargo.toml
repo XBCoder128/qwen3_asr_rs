@@ -19,6 +19,11 @@ path = "src/bin/server.rs"
 name = "test_streaming"
 path = "src/bin/test_streaming.rs"
 
+[[example]]
+name = "warmup_bench"
+path = "examples/warmup_bench.rs"
+required-features = ["mlx"]
+
 [dependencies]
 tch = { version = "0.20", optional = true }
 tokenizers = "0.21"

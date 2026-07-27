@@ -907,7 +907,18 @@ impl Tensor {
         }
     }
 
-    /// Apply rotary position embeddings using cos/sin tensors.
+    /// Apply rotary position embeddings using precomputed cos/sin tensors.
+    ///
+    /// NOTE: `mlx_fast_rope` (declared in ffi.rs) was evaluated but CANNOT be
+    /// used here. This model uses MRoPE (Multi-dimensional Rotary Position
+    /// Embedding) with `mrope_section = [24, 20, 20]` — different sections of
+    /// the head dimension use different position IDs from a 3D position array.
+    /// `mlx_fast_rope` only accepts a single scalar `offset` applied uniformly
+    /// across all rotated dims, and even `mlx_fast_rope_dynamic` (per-token
+    /// offset array) cannot split head dims into sections with independent
+    /// positions. The manual cos/sin approach is therefore necessary and correct
+    /// for MRoPE; the cos/sin tensors are precomputed in `compute_mrope_cos_sin`
+    /// which encodes the per-section position structure.
     pub fn apply_rope(&self, cos: &Tensor, sin: &Tensor) -> Tensor {
         let cos = cos.unsqueeze(0).unsqueeze(0);
         let sin = sin.unsqueeze(0).unsqueeze(0);

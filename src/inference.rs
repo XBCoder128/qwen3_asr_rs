@@ -171,18 +171,32 @@ impl AsrInference {
         // Eval prefill output to materialize computation graph before decode loop
         logits.eval();
 
-        // Step 8: Autoregressive generation (pipelined greedy decode: the
-        // GPU computes step i+1 while the CPU checks step i for EOS).
+        // Step 8: Pipelined autoregressive generation (double-buffer).
+        //
+        // The GPU computes step i+1 while the CPU reads token i and checks EOS.
+        // `mlx_async_eval` submits the graph to the GPU without blocking; reading
+        // the token via `int64_value` triggers an implicit sync only on that
+        // single scalar. This overlaps GPU kernel execution with CPU bookkeeping.
+        //
+        // Invariant: at the top of each iteration, `token_arr` holds the argmax
+        // result for the CURRENT step whose GPU work has been async-submitted.
+        // We read it (blocking), check EOS, then fire the NEXT step's forward +
+        // argmax via async_eval before looping.
+        //
+        // On EOS the last async step (already submitted) is wasted — this is
+        // harmless (result is simply not read) and avoids branch-prediction stalls.
         let mut generated_ids: Vec<i64> = Vec::new();
         let eos_token_ids = vec![ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID];
 
         let first_logits = logits.narrow(1, seq_len as i64 - 1, 1).squeeze_dim(1);
         let mut current_pos = seq_len;
 
+        // Bootstrap: submit first argmax via async_eval
         let mut token_arr = first_logits.argmax(-1, false);
-        token_arr.eval();
+        Tensor::async_eval(&[&token_arr]);
 
-        for _ in 0..max_new_tokens {
+        for _step in 0..max_new_tokens {
+            // Read the current token (blocks until GPU delivers this scalar)
             let token = token_arr.int64_value(&[0]);
             if eos_token_ids.contains(&token) {
                 break;
@@ -193,6 +207,8 @@ impl AsrInference {
                 break;
             }
 
+            // Submit NEXT step's forward pass via async_eval (GPU works on this
+            // while we loop back and read the result of the CURRENT submission).
             let next_input = Tensor::from_slice_i64(&[token]).to_device(self.device);
             let next_hidden = self.text_decoder.embed(&next_input).unsqueeze(0);
 
@@ -205,9 +221,13 @@ impl AsrInference {
                 .text_decoder
                 .forward(&next_hidden, &new_cos, &new_sin, &mut kv_cache, None)
                 .squeeze_dim(1);
-            token_arr = next_logits.argmax(-1, false);
-            token_arr.eval();
+            let new_token_arr = next_logits.argmax(-1, false);
+            // Submit GPU work for the next token without blocking
+            Tensor::async_eval(&[&new_token_arr]);
 
+            // Advance: the submission we just made becomes the "current" for the
+            // next iteration.
+            token_arr = new_token_arr;
             current_pos += 1;
         }
 
@@ -246,6 +266,58 @@ impl AsrInference {
             raw_output: raw_text,
             duration_seconds,
         })
+    }
+
+    /// Warm up the GPU by running a full forward pass (encoder + decode) on
+    /// a ~1 s silent sample. This forces Metal shader JIT compilation so that
+    /// the first real inference does not pay the ~2 s cold-start penalty.
+    ///
+    /// Call once after `load()` and before the first real transcription.
+    /// The method exercises both offline and streaming code paths to ensure
+    /// all kernel shapes are compiled.
+    ///
+    /// **Coverage note:** The 1 s silence only covers short-audio shapes.
+    /// The first long-audio input (e.g. 30 s, ~750 audio tokens) may still
+    /// trigger partial Metal shader JIT for those larger tensor geometries.
+    pub fn warmup(&mut self) -> Result<()> {
+        tracing::info!("[warmup] Starting GPU warmup (silent ~1s sample)...");
+        let t0 = std::time::Instant::now();
+
+        // 1 second of silence at 16 kHz
+        let silence: Vec<f32> = vec![0.0f32; MEL_SAMPLE_RATE as usize];
+
+        // Run offline forward (encoder + prefill + a few decode steps)
+        let _ = self.transcribe_samples(&silence, None)?;
+
+        // Run streaming forward to warm the streaming-specific shapes
+        // (chunk-local attention, incremental prefill).
+        // Use a closure to guarantee set_chunk_local(false) runs even on error,
+        // preventing chunk_local state leakage into subsequent offline transcriptions.
+        let streaming_result = (|| -> Result<()> {
+            let mut state = self.init_streaming(None, 0)?;
+            // Feed ~0.5 s first chunk
+            let half = MEL_SAMPLE_RATE as usize / 2;
+            let _ = self.streaming_transcribe(&silence[..half], &mut state)?;
+            // Feed full 1 s (incremental path)
+            let _ = self.streaming_transcribe(&silence, &mut state)?;
+            Ok(())
+        })();
+        // Always restore non-chunk-local mode regardless of success/failure
+        self.audio_encoder.set_chunk_local(false);
+        streaming_result?;
+
+        // Synchronize to ensure all Metal shaders are compiled
+        #[cfg(feature = "mlx")]
+        {
+            crate::backend::mlx::stream::synchronize();
+            crate::backend::mlx::stream::clear_cache();
+        }
+
+        tracing::info!(
+            "[warmup] GPU warmup complete in {:.0}ms",
+            t0.elapsed().as_millis()
+        );
+        Ok(())
     }
 
     fn build_prompt(
@@ -723,11 +795,14 @@ impl AsrInference {
 
         let mut generated_ids = prefix_ids.clone();
 
+        // Pipelined decode: async_eval submits GPU work, int64_value blocks
+        // only on the scalar read. GPU computes step i+1 while CPU checks step i.
         let mut token_arr = first_logits.argmax(-1, false);
-        token_arr.eval();
+        Tensor::async_eval(&[&token_arr]);
 
         let decode_result = (|| -> Result<()> {
             for _ in 0..max_new_tokens {
+                // Block to read current token (GPU delivers just the scalar)
                 let token = token_arr.int64_value(&[0]);
                 if eos_token_ids.contains(&token) {
                     break;
@@ -742,6 +817,8 @@ impl AsrInference {
                     break;
                 }
 
+                // Submit next step's forward via async_eval (GPU works on this
+                // while we loop back and read)
                 let next_input = Tensor::from_slice_i64(&[token]).to_device(state.device);
                 let next_hidden = self.text_decoder.embed(&next_input).unsqueeze(0);
                 ensure_rope_span(self, state, current_pos, 1)?;
@@ -753,7 +830,7 @@ impl AsrInference {
                     .forward(&next_hidden, &new_cos, &new_sin, &mut kv_cache, None)
                     .squeeze_dim(1);
                 token_arr = next_logits.argmax(-1, false);
-                token_arr.eval();
+                Tensor::async_eval(&[&token_arr]);
                 current_pos += 1;
             }
             Ok(())
