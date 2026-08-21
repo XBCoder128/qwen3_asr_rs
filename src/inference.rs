@@ -21,6 +21,15 @@ pub struct AsrInference {
     tokenizer: AsrTokenizer,
     config: AsrConfig,
     device: Device,
+    /// Banned output token IDs (chat-template / multimodal control markup)
+    /// as a CPU set for O(1) checks in the decode loop.
+    banned_output_ids_set: std::collections::HashSet<i64>,
+    /// Additive logit mask (vocab,) with -inf at banned output tokens.
+    /// Only materialized on the rare correction path: when greedy argmax
+    /// picks a banned token, the step's logits are re-argmaxed through this
+    /// mask so the decode continues with the best legal token instead of
+    /// derailing into a new chat turn.
+    decode_ban_mask: Tensor,
 }
 
 impl AsrInference {
@@ -61,6 +70,30 @@ impl AsrInference {
         tracing::info!("Loading tokenizer...");
         let tokenizer = AsrTokenizer::from_dir(model_dir).context("Failed to load tokenizer")?;
 
+        // Build the banned-token set + logit mask. The mask must already be
+        // in the model dtype: an f32 mask would promote the decode graph to
+        // f32 on the correction path.
+        let banned_ids: Vec<i64> = tokenizer.banned_output_ids();
+        let banned_output_ids_set: std::collections::HashSet<i64> =
+            banned_ids.iter().copied().collect();
+        let model_dtype = text_decoder.dtype();
+        let vocab_size = text_decoder.vocab_size() as usize;
+        let mut ban = vec![0.0f32; vocab_size];
+        for &id in &banned_ids {
+            if id >= 0 && (id as usize) < vocab_size {
+                ban[id as usize] = f32::NEG_INFINITY;
+            }
+        }
+        let decode_ban_mask = Tensor::from_slice_f32(&ban)
+            .to_dtype(model_dtype)
+            .to_device(device);
+        decode_ban_mask.eval();
+        tracing::info!(
+            "Decode junk-token guard: {}/{} tokens banned from output",
+            banned_ids.len(),
+            vocab_size
+        );
+
         // Create mel feature extractor
         let mel_extractor = WhisperFeatureExtractor::new(
             400, // n_fft
@@ -79,6 +112,8 @@ impl AsrInference {
             tokenizer,
             config,
             device,
+            banned_output_ids_set,
+            decode_ban_mask,
         })
     }
 
@@ -130,8 +165,11 @@ impl AsrInference {
         // Step 6: Precompute MRoPE cos/sin for all positions (prefill + max decode)
         let text_config = &self.config.thinker_config.text_config;
         // Dense Chinese speech can be ~4–8 tokens/sec. The old hard cap of 256
-        // truncated ~7‑minute files to ~1 minute of transcript.
-        let max_new_tokens: usize = ((duration_seconds * 8.0).ceil() as usize)
+        // truncated ~7‑minute files to ~1 minute of transcript. 10 tok/s gives
+        // headroom above the densest real speech so the transcript is never
+        // cut mid-sentence (the budget is only a cap — EOS still stops early,
+        // so raising it costs nothing on normal audio).
+        let max_new_tokens: usize = ((duration_seconds * 10.0).ceil() as usize)
             .max(256)
             .min(8192);
         tracing::info!(
@@ -191,13 +229,27 @@ impl AsrInference {
         let first_logits = logits.narrow(1, seq_len as i64 - 1, 1).squeeze_dim(1);
         let mut current_pos = seq_len;
 
-        // Bootstrap: submit first argmax via async_eval
-        let mut token_arr = first_logits.argmax(-1, false);
+        // Bootstrap: submit first argmax via async_eval.
+        // `cur_logits` stays alive so a banned-token pick can be corrected
+        // without recomputing the forward pass.
+        let mut cur_logits = first_logits;
+        let mut token_arr = cur_logits.argmax(-1, false);
         Tensor::async_eval(&[&token_arr]);
 
         for _step in 0..max_new_tokens {
-            // Read the current token (blocks until GPU delivers this scalar)
-            let token = token_arr.int64_value(&[0]);
+            // Read the current token (blocks until GPU delivers this scalar).
+            // Junk-token guard: if greedy picked a banned markup token (chat
+            // template / multimodal control), re-run argmax over the masked
+            // logits of THIS step. The mask add only executes on this rare
+            // path, so the normal decode step is bit-for-bit as fast as
+            // without the guard.
+            let mut token = token_arr.int64_value(&[0]);
+            if self.banned_output_ids_set.contains(&token) {
+                token = (&cur_logits + &self.decode_ban_mask)
+                    .argmax(-1, false)
+                    .int64_value(&[0]);
+                tracing::debug!("[decode] suppressed banned token id={token}");
+            }
             if eos_token_ids.contains(&token) {
                 break;
             }
@@ -227,6 +279,7 @@ impl AsrInference {
 
             // Advance: the submission we just made becomes the "current" for the
             // next iteration.
+            cur_logits = next_logits;
             token_arr = new_token_arr;
             current_pos += 1;
         }
@@ -504,7 +557,14 @@ pub struct StreamingState {
     /// Max NEW tokens decoded per streaming call (beyond the prefix).
     /// Official streaming examples use a small budget (32) — a large budget
     /// lets a derailed decode hallucinate long passages of unrelated text.
+    /// This is a FLOOR: the effective per-call budget also scales with the
+    /// amount of NEW audio in the call (see `streaming_transcribe_with_tail`)
+    /// so a long VAD segment fed in one call is never truncated.
     pub max_new_tokens: usize,
+    /// Total samples already seen by this state. Used to size the decode
+    /// budget for the NEW audio of each call (a fresh state fed a whole
+    /// segment must decode it all; an incremental partial only needs a few).
+    seen_samples: usize,
     /// Forced language (e.g. "english", "chinese"). None = auto-detect.
     forced_language: Option<String>,
     /// Token IDs for the language prefix (e.g. "language English").
@@ -627,6 +687,7 @@ impl AsrInference {
             chunk_id: 0,
             unfixed_chunk_num: 2,
             max_new_tokens: 32,
+            seen_samples: 0,
             forced_language,
             language_prefix_ids,
             context_prefix_ids,
@@ -779,13 +840,31 @@ impl AsrInference {
         // NEW tokens for this call's fresh audio (the prefix is prefilled),
         // so a small budget is enough — and it caps how far a derailed
         // decode can hallucinate.
+        // It scales with the NEW audio of this call: incremental partials on
+        // ~1s of new audio stay at the small default (32), but a fresh state
+        // handed a whole VAD segment (or a re-decode after a language lock)
+        // gets a budget that actually covers the segment — the old fixed 32
+        // silently truncated any call with more than ~5s of new speech.
+        let new_samples = samples.len().saturating_sub(state.seen_samples);
+        state.seen_samples = samples.len();
+        let new_secs = new_samples as f64 / MEL_SAMPLE_RATE as f64;
         // Take KV out so ensure_rope_span can mutably grow cos/sin mid-decode.
         let mut kv_cache = state
             .kv_cache
             .take()
             .ok_or_else(|| anyhow::anyhow!("streaming decode missing kv_cache"))?;
         let seq_len = state.cache_seq_len;
-        let max_new_tokens: usize = state.max_new_tokens.max(state.rollback_tokens + 8);
+        let max_new_tokens: usize = state
+            .max_new_tokens
+            .max((new_secs * 16.0).ceil() as usize + 16)
+            .max(state.rollback_tokens + 8)
+            .min(1024);
+        tracing::debug!(
+            "[streaming] decode budget: {} (new audio {:.2}s, floor {})",
+            max_new_tokens,
+            new_secs,
+            state.max_new_tokens
+        );
         let eos_token_ids = vec![ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID];
 
         // logits has shape (1, num_prefilled, vocab_size). We need the last one.
@@ -797,13 +876,22 @@ impl AsrInference {
 
         // Pipelined decode: async_eval submits GPU work, int64_value blocks
         // only on the scalar read. GPU computes step i+1 while CPU checks step i.
-        let mut token_arr = first_logits.argmax(-1, false);
+        // `cur_logits` stays alive for the junk-token correction path.
+        let mut cur_logits = first_logits;
+        let mut token_arr = cur_logits.argmax(-1, false);
         Tensor::async_eval(&[&token_arr]);
 
         let decode_result = (|| -> Result<()> {
             for _ in 0..max_new_tokens {
-                // Block to read current token (GPU delivers just the scalar)
-                let token = token_arr.int64_value(&[0]);
+                // Block to read current token (GPU delivers just the scalar).
+                // Junk-token guard: same lazy correction as the offline loop.
+                let mut token = token_arr.int64_value(&[0]);
+                if self.banned_output_ids_set.contains(&token) {
+                    token = (&cur_logits + &self.decode_ban_mask)
+                        .argmax(-1, false)
+                        .int64_value(&[0]);
+                    tracing::debug!("[streaming] suppressed banned token id={token}");
+                }
                 if eos_token_ids.contains(&token) {
                     break;
                 }
@@ -829,7 +917,8 @@ impl AsrInference {
                     .text_decoder
                     .forward(&next_hidden, &new_cos, &new_sin, &mut kv_cache, None)
                     .squeeze_dim(1);
-                token_arr = next_logits.argmax(-1, false);
+                cur_logits = next_logits;
+                token_arr = cur_logits.argmax(-1, false);
                 Tensor::async_eval(&[&token_arr]);
                 current_pos += 1;
             }

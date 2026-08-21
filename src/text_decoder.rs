@@ -187,6 +187,11 @@ impl TextDecoder {
         self.embed_tokens.kind()
     }
 
+    /// Number of rows in the token embedding (= lm_head vocab size).
+    pub fn vocab_size(&self) -> i64 {
+        self.embed_tokens.size()[0]
+    }
+
     pub fn forward(
         &self,
         hidden_states: &Tensor,

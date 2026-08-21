@@ -93,6 +93,21 @@ Pipeline: **Audio → FFmpeg decode → 16kHz mono → Mel spectrogram → Audio
 - Decode: single-token steps, **no mask needed** (causal mask for seq_len=1 is all-zeros)
 - MRoPE cos/sin precomputed for all positions, indexed per step via `narrow`
 - EOS tokens: ENDOFTEXT (151643) or IM_END (151645)
+- **Junk-token guard (applied)**: `AsrTokenizer::banned_output_ids()` derives the
+  set of added tokens minus {ENDOFTEXT, IM_END, ASR_TEXT} — chat-template /
+  multimodal control markup that must never be *generated*. The decode loops
+  keep the current step's logits alive (`cur_logits`) and, when argmax picks a
+  banned token, re-argmax through a -inf mask (`decode_ban_mask`, model dtype,
+  built at load). Lazy on purpose: the mask add only runs on the rare
+  correction path — applying it every step cost ~2-3ms/step on MLX (a full
+  151k-element broadcast add per token), the lazy form is bit-for-bit as fast
+  as no guard.
+- **Decode budgets (applied)**: offline `max_new_tokens = duration*10`
+  (clamped [256, 8192]); streaming per-call budget
+  `max(floor, new_secs*16 + 16, rollback+8)` clamped to 1024, where
+  `new_secs` is the NEW audio this call (tracked via `state.seen_samples`).
+  A fixed 32 truncated any call fed >~5s of new speech (fresh VAD segment,
+  language-lock re-decode). Budgets are caps only — EOS still stops early.
 
 ### Special Token IDs (`tokenizer.rs`)
 | Token | ID |

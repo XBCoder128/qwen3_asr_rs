@@ -47,6 +47,28 @@ impl AsrTokenizer {
             .map_err(|e| anyhow::anyhow!("Decoding failed: {}", e))?;
         Ok(text)
     }
+
+    /// Token IDs that must never be *generated* during ASR decoding.
+    ///
+    /// The added-token block of the Qwen vocab is entirely control markup
+    /// (chat-template markers, vision/box/audio/tts tokens, blanks, tool
+    /// markers). None of it is legitimate transcription output, but greedy
+    /// argmax occasionally lands on one mid-decode (observed: `<|im_start|>`
+    /// → the model continues a whole new chat turn, producing
+    /// `assistant<asr_text>…` garbage that must be stripped downstream, and
+    /// in streaming it poisons the next call's rollback prefix).
+    ///
+    /// Kept legal: the two EOS tokens and `<asr_text>` (part of the model's
+    /// normal `language X<asr_text>…` output format).
+    pub fn banned_output_ids(&self) -> Vec<i64> {
+        const OUTPUT_LEGAL: [&str; 3] = ["<|endoftext|>", "<|im_end|>", "<asr_text>"];
+        self.tokenizer
+            .get_added_tokens_decoder()
+            .iter()
+            .filter(|(_, tok)| !OUTPUT_LEGAL.contains(&tok.content.as_str()))
+            .map(|(id, _)| *id as i64)
+            .collect()
+    }
 }
 
 // Special token IDs for Qwen3-ASR
@@ -59,3 +81,42 @@ pub const AUDIO_PAD_TOKEN_ID: i64 = 151676;
 pub const ASR_TEXT_TOKEN_ID: i64 = 151704;
 /// ForcedAligner `<timestamp>` token.
 pub const TIMESTAMP_TOKEN_ID: i64 = 151705;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Requires a local model dir (tokenizer.json); skips otherwise.
+    #[test]
+    fn banned_output_ids_excludes_eos_and_asr_text() {
+        let model_dir = std::path::Path::new("Qwen3-ASR-0.6B");
+        if !model_dir.join("tokenizer.json").exists() {
+            eprintln!("skipping: no local model dir");
+            return;
+        }
+        let tok = AsrTokenizer::from_dir(model_dir).unwrap();
+        let banned = tok.banned_output_ids();
+
+        assert!(!banned.is_empty(), "expected the added-token block to be banned");
+        for legal in [
+            ENDOFTEXT_TOKEN_ID,
+            IM_END_TOKEN_ID,
+            ASR_TEXT_TOKEN_ID,
+        ] {
+            assert!(
+                !banned.contains(&legal),
+                "token {legal} must stay legal in output"
+            );
+        }
+        for must_ban in [
+            IM_START_TOKEN_ID,
+            AUDIO_START_TOKEN_ID,
+            AUDIO_END_TOKEN_ID,
+            AUDIO_PAD_TOKEN_ID,
+        ] {
+            assert!(banned.contains(&must_ban), "token {must_ban} must be banned");
+        }
+        // Banned ids all live in the added-token block (>= im_start id).
+        assert!(banned.iter().all(|&id| id >= IM_START_TOKEN_ID));
+    }
+}
