@@ -10,12 +10,12 @@ use clap::Parser;
 use serde::Serialize;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-use qwen3_asr_rs::inference::AsrInference;
+use qwen3_asr_rs::inference::{AsrInference, TranscribeResult};
 use qwen3_asr_rs::tensor::Device;
 
 // ---------------------------------------------------------------------------
@@ -52,8 +52,72 @@ struct Args {
 
 #[derive(Clone)]
 struct AppState {
-    model: Arc<std::sync::Mutex<AsrInference>>,
+    worker: mpsc::SyncSender<InferenceRequest>,
     default_language: Option<String>,
+}
+
+struct InferenceRequest {
+    path: String,
+    language: Option<String>,
+    reply: mpsc::SyncSender<Result<TranscribeResult, String>>,
+}
+
+fn start_inference_worker(model_dir: PathBuf) -> Result<mpsc::SyncSender<InferenceRequest>> {
+    let (tx, rx) = mpsc::sync_channel::<InferenceRequest>(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(0);
+
+    std::thread::Builder::new()
+        .name("asr-inference".into())
+        .spawn(move || {
+            let loaded = (|| -> Result<AsrInference> {
+                #[cfg(feature = "tch-backend")]
+                let device = if tch::Cuda::is_available() {
+                    tracing::info!("Using CUDA device");
+                    Device::Gpu(0)
+                } else {
+                    tracing::info!("Using CPU device");
+                    Device::Cpu
+                };
+
+                #[cfg(feature = "mlx")]
+                let device = {
+                    qwen3_asr_rs::backend::mlx::stream::init_mlx(true);
+                    tracing::info!("Using MLX Metal GPU");
+                    Device::Gpu(0)
+                };
+
+                tracing::info!("Loading model from {:?}", model_dir);
+                let mut model =
+                    AsrInference::load(&model_dir, device).context("Failed to load model")?;
+                model.warmup().context("Failed to warm model")?;
+                Ok(model)
+            })();
+
+            let model = match loaded {
+                Ok(model) => {
+                    let _ = ready_tx.send(Ok(()));
+                    model
+                }
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!("{error:#}")));
+                    return;
+                }
+            };
+
+            while let Ok(request) = rx.recv() {
+                let result = model
+                    .transcribe(&request.path, request.language.as_deref())
+                    .map_err(|error| format!("{error:#}"));
+                let _ = request.reply.send(result);
+            }
+        })
+        .context("Failed to spawn inference worker")?;
+
+    ready_rx
+        .recv()
+        .context("Inference worker exited during startup")?
+        .map_err(anyhow::Error::msg)?;
+    Ok(tx)
 }
 
 // ---------------------------------------------------------------------------
@@ -215,13 +279,21 @@ async fn transcribe_handler(
     let tmp_path_str = tmp_path.to_string_lossy().to_string();
 
     // Run inference in blocking task (GPU-bound)
-    let model = state.model.clone();
+    let worker = state.worker.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _keep = tmp_path; // ensure temp file lives until transcription completes
-        let model = model
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        model.transcribe(&tmp_path_str, lang.as_deref())
+        let (reply, response) = mpsc::sync_channel(0);
+        worker
+            .send(InferenceRequest {
+                path: tmp_path_str,
+                language: lang,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("Inference worker exited"))?;
+        response
+            .recv()
+            .map_err(|_| anyhow::anyhow!("Inference worker exited"))?
+            .map_err(anyhow::Error::msg)
     })
     .await
     .map_err(|e| AppError(anyhow::anyhow!("Blocking task failed: {}", e)))??;
@@ -267,30 +339,13 @@ async fn main() -> Result<()> {
         anyhow::bail!("Model directory not found: {}", args.model_dir);
     }
 
-    // Select device
-    #[cfg(feature = "tch-backend")]
-    let device = if tch::Cuda::is_available() {
-        tracing::info!("Using CUDA device");
-        Device::Gpu(0)
-    } else {
-        tracing::info!("Using CPU device");
-        Device::Cpu
-    };
-
-    #[cfg(feature = "mlx")]
-    let device = {
-        qwen3_asr_rs::backend::mlx::stream::init_mlx(true);
-        tracing::info!("Using MLX Metal GPU");
-        Device::Gpu(0)
-    };
-
-    // Load model
-    tracing::info!("Loading model from {:?}", model_dir);
-    let model = AsrInference::load(model_dir, device).context("Failed to load model")?;
-    tracing::info!("Model loaded successfully");
+    // MLX streams are thread-bound. The worker owns backend initialization,
+    // model load, warmup, and every inference request on the same thread.
+    let worker = start_inference_worker(model_dir.to_path_buf())?;
+    tracing::info!("Model loaded and warmed successfully");
 
     let state = AppState {
-        model: Arc::new(std::sync::Mutex::new(model)),
+        worker,
         default_language: args.language,
     };
 

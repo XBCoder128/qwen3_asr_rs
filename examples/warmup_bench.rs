@@ -69,9 +69,11 @@ fn main() -> Result<()> {
     if result1.text == result2.text {
         eprintln!("\n[bench] ✓ Output consistent across runs");
     } else {
-        eprintln!("\n[bench] ✗ WARNING: Output differs between runs!");
-        eprintln!("  Run 1: {}", result1.text);
-        eprintln!("  Run 2: {}", result2.text);
+        anyhow::bail!(
+            "post-warmup output differs between runs\nRun 1: {}\nRun 2: {}",
+            result1.text,
+            result2.text
+        );
     }
 
     eprintln!("\n[bench] Summary:");

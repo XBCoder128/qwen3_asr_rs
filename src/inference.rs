@@ -326,8 +326,9 @@ impl AsrInference {
     /// the first real inference does not pay the ~2 s cold-start penalty.
     ///
     /// Call once after `load()` and before the first real transcription.
-    /// The method exercises both offline and streaming code paths to ensure
-    /// all kernel shapes are compiled.
+    /// Only the offline path is exercised. Running the streaming path first
+    /// changes MLX's offline numerics on some machines, which can alter the
+    /// greedy transcript. Streaming therefore pays its own one-time compile.
     ///
     /// **Coverage note:** The 1 s silence only covers short-audio shapes.
     /// The first long-audio input (e.g. 30 s, ~750 audio tokens) may still
@@ -341,23 +342,6 @@ impl AsrInference {
 
         // Run offline forward (encoder + prefill + a few decode steps)
         let _ = self.transcribe_samples(&silence, None)?;
-
-        // Run streaming forward to warm the streaming-specific shapes
-        // (chunk-local attention, incremental prefill).
-        // Use a closure to guarantee set_chunk_local(false) runs even on error,
-        // preventing chunk_local state leakage into subsequent offline transcriptions.
-        let streaming_result = (|| -> Result<()> {
-            let mut state = self.init_streaming(None, 0)?;
-            // Feed ~0.5 s first chunk
-            let half = MEL_SAMPLE_RATE as usize / 2;
-            let _ = self.streaming_transcribe(&silence[..half], &mut state)?;
-            // Feed full 1 s (incremental path)
-            let _ = self.streaming_transcribe(&silence, &mut state)?;
-            Ok(())
-        })();
-        // Always restore non-chunk-local mode regardless of success/failure
-        self.audio_encoder.set_chunk_local(false);
-        streaming_result?;
 
         // Synchronize to ensure all Metal shaders are compiled
         #[cfg(feature = "mlx")]
